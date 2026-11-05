@@ -1,0 +1,367 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const hongguoAppBaseURL = "https://api5-normal-sinfonlineb.fqnovel.com"
+
+const hongguoAppUserAgent = "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
+
+const hongguoPlaybackUserAgent = "com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
+
+const hongguoEmptyResponseRetryDelay = 250 * time.Millisecond
+
+var errHongguoEmptyResponse = errors.New("红果 App 接口返回空响应")
+
+type hongguoCatalogCursor struct {
+	Offset        int       `json:"offset"`
+	SessionID     string    `json:"sessionId,omitempty"`
+	LastID        string    `json:"lastId,omitempty"`
+	PageSignature string    `json:"pageSignature,omitempty"`
+	Initialized   bool      `json:"initialized"`
+	Exhausted     bool      `json:"exhausted"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type hongguoCatalogState struct {
+	Version   int                             `json:"version"`
+	DeviceID  string                          `json:"deviceId"`
+	InstallID string                          `json:"installId"`
+	Feeds     map[string]hongguoCatalogCursor `json:"feeds"`
+}
+
+type hongguoAppClient struct {
+	signatureMu               sync.Mutex
+	signatures                map[[32]byte]hongguoCachedSignature
+	signatureStatus           hongguoSignatureStatus
+	searchCursorMu            sync.Mutex
+	searchCursors             map[string]hongguoSearchCursor
+	deviceRegistration        chan struct{}
+	deviceIdentity            hongguoDeviceIdentity
+	deviceRotationPausedUntil time.Time
+	deviceIdentityLoaded      bool
+	deviceIdentityPersisted   bool
+	mu                        sync.Mutex
+	catalogMu                 sync.Mutex
+	baseURL                   string
+	state                     hongguoCatalogState
+	details                   map[string]hongguoDetailEntry
+	pending                   map[string]*hongguoDetailCall
+	searches                  map[string]hongguoSearchEntry
+	searchPending             map[string]*hongguoSearchCall
+	suggestions               map[string]hongguoSuggestionEntry
+	suggestPending            map[string]*hongguoSuggestionCall
+	danmaku                   map[string]hongguoDanmakuCacheEntry
+	danmakuPending            map[string]*hongguoDanmakuCall
+}
+
+func (downloader *Downloader) hongguoClient() *hongguoAppClient {
+	downloader.hongguoOnce.Do(func() {
+		downloader.hongguo = &hongguoAppClient{
+			baseURL:            hongguoAppBaseURL,
+			deviceRegistration: make(chan struct{}, 1),
+			state:              hongguoCatalogState{Version: 1, DeviceID: newHongguoDeviceID(), InstallID: newHongguoDeviceID(), Feeds: map[string]hongguoCatalogCursor{}},
+			details:            map[string]hongguoDetailEntry{}, pending: map[string]*hongguoDetailCall{},
+			searches: map[string]hongguoSearchEntry{}, searchPending: map[string]*hongguoSearchCall{},
+			suggestions: map[string]hongguoSuggestionEntry{}, suggestPending: map[string]*hongguoSuggestionCall{},
+		}
+	})
+	return downloader.hongguo
+}
+
+func cloneHongguoCatalogState(state *hongguoCatalogState) *hongguoCatalogState {
+	if state == nil {
+		return nil
+	}
+	cloned := *state
+	cloned.Feeds = make(map[string]hongguoCatalogCursor, len(state.Feeds))
+	for name, cursor := range state.Feeds {
+		cloned.Feeds[name] = cursor
+	}
+	return &cloned
+}
+
+func (downloader *Downloader) restoreHongguoCatalog(state *hongguoCatalogState) {
+	if state == nil || state.Version != 1 || !hongguoNumericID.MatchString(state.DeviceID) || !hongguoNumericID.MatchString(state.InstallID) {
+		return
+	}
+	cloned := cloneHongguoCatalogState(state)
+	for name, cursor := range cloned.Feeds {
+		known := false
+		for _, genre := range hongguoAppGenres {
+			known = known || name == genre.key || name == "category:"+genre.key
+		}
+		if !known || !cursor.Initialized || cursor.Offset < 0 || cursor.Offset > 1_000_000 || len(cursor.SessionID) > 4096 || len(cursor.LastID) > 256 || len(cursor.PageSignature) > 64 {
+			delete(cloned.Feeds, name)
+		}
+	}
+	client := downloader.hongguoClient()
+	client.catalogMu.Lock()
+	defer client.catalogMu.Unlock()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.state.Feeds) == 0 {
+		client.state = *cloned
+	}
+}
+
+func (downloader *Downloader) hongguoCatalogSnapshot() *hongguoCatalogState {
+	client := downloader.hongguoClient()
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return cloneHongguoCatalogState(&client.state)
+}
+
+func hongguoCatalogInitialized(state *hongguoCatalogState) bool {
+	if state != nil && state.Version == 1 {
+		for _, cursor := range state.Feeds {
+			if cursor.Initialized {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hongguoCatalogHasMore(state *hongguoCatalogState) bool {
+	for _, genre := range hongguoAppGenres {
+		if state == nil || !state.Feeds[genre.key].Exhausted {
+			return true
+		}
+	}
+	return false
+}
+
+func (downloader *Downloader) hongguoAppRequest(ctx context.Context, method, path string, extra url.Values, payload any) (map[string]any, error) {
+	client := downloader.hongguoClient()
+	client.mu.Lock()
+	base := client.baseURL
+	client.mu.Unlock()
+	singlePlayback := method == http.MethodPost && path == hongguoSingleVideoModelPath
+	registeredProtocol := singlePlayback || path == "/reading/distribution/category/landpage/v/" || path == "/novel/player/video_detail/v1/"
+	playbackModel := method == http.MethodPost && path == hongguoVideoModelPath
+	if playbackModel {
+		ctx = context.WithValue(ctx, hongguoPlaybackTransportKey{}, true)
+	}
+	var identity hongguoDeviceIdentity
+	var err error
+	if !playbackModel {
+		identity, err = downloader.ensureHongguoDeviceIdentity(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	query := url.Values{
+		"aid": {"8662"}, "app_name": {"novelread"}, "version_code": {"73532"}, "version_name": {"7.3.5.32"},
+		"manifest_version_code": {"73532"}, "update_version_code": {"73532"}, "channel": {"update_64"},
+		"device_platform": {"android"}, "os": {"android"}, "ssmix": {"a"}, "device_type": {"25053RT47C"},
+		"device_brand": {"Redmi"}, "language": {"zh"}, "os_api": {"36"}, "os_version": {"16"},
+		"resolution": {"1280*2772"}, "dpi": {"520"}, "ac": {"wifi"}, "device_id": {identity.DeviceID}, "iid": {identity.InstallID},
+	}
+	for key, values := range extra {
+		query[key] = append([]string(nil), values...)
+	}
+	query.Set("device_id", identity.DeviceID)
+	query.Set("iid", identity.InstallID)
+	var body []byte
+	if payload != nil {
+		body, err = json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+	attempts := downloader.cfg.Retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 3 {
+		attempts = 3
+	}
+	searchRequest := path == hongguoSearchAppPath
+	if searchRequest && attempts < 2 {
+		attempts = 2
+	}
+	emptyRetry := singlePlayback || playbackModel || searchRequest || path == "/novel/player/video_detail/v1/" || path == "/reading/distribution/category/landpage/v/"
+	if emptyRetry && attempts < 2 {
+		attempts = 2
+	}
+	if playbackModel {
+		attempts = 4
+	}
+	var lastErr error
+	emptyResponses := 0
+	rotations := 0
+	retryDelay := time.Second
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(lastErr, err)
+		}
+		if attempt > 0 || rotations > 0 {
+			select {
+			case <-time.After(retryDelay):
+			case <-ctx.Done():
+				return nil, errors.Join(lastErr, ctx.Err())
+			}
+		}
+		retryDelay = time.Duration(attempt+1) * time.Second
+		var playbackIdentities [32]hongguoDeviceIdentity
+		if playbackModel {
+			for i := range playbackIdentities {
+				playbackIdentities[i], err = newHongguoPlaybackIdentity()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+
+		request, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base, "/")+path, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("User-Agent", hongguoAppUserAgent)
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("X-XS-From-Web", "0")
+		request.Header.Set("Sdk-Version", "2")
+		if playbackModel {
+			request.Header.Set("User-Agent", hongguoPlaybackUserAgent)
+			request.Header.Set("Accept", "application/json; charset=utf-8,application/x-protobuf")
+			request.Header.Set("X-Tt-Request-Tag", "t=0;n=0")
+			request.Header.Set("X-Tt-Dt", "")
+			request.Header.Set("Passport-Sdk-Version", "50561")
+			request.Header.Set("X-Vc-Bdturing-Sdk-Version", "3.7.2.cn")
+		}
+		if identity.Cookie != "" && !registeredProtocol {
+			request.Header.Set("Cookie", identity.Cookie)
+		}
+		comment, _ := ctx.Value(hongguoCommentKey{}).(bool)
+		var commentNonce hongguoCommentNonce
+		if comment {
+			commentNonce, err = newHongguoCommentNonce()
+			if err != nil {
+				return nil, errors.New("无法准备红果文字请求")
+			}
+			request.Header.Set("Comment-Source", "601")
+			request.Header.Set("Server-Channel", "1000")
+		}
+		if payload != nil {
+			request.Header.Set("Content-Type", "application/json; charset=utf-8")
+			if playbackModel {
+				request.Header.Set("Content-Type", "application/json; charset=UTF-8")
+			}
+		}
+		timeout := 20 * time.Second
+		if playbackModel {
+			timeout = 15 * time.Second
+		}
+		response, err := downloader.doPreparedCatalogRequest(request, timeout, func(prepared *http.Request) {
+			now := time.Now()
+			query.Set("_rticket", strconv.FormatInt(now.UnixMilli(), 10))
+			prepared.URL.RawQuery = query.Encode()
+			if playbackModel {
+				client.preparePlaybackSignature(prepared, body, now, playbackIdentities)
+			} else if comment {
+				signHongguoCommentRequest(prepared, commentNonce, now)
+			} else if registeredProtocol {
+				signHongguoPlayerRequest(prepared, body, now)
+				client.signatureMu.Lock()
+				client.signatureStatus.Generated++
+				client.signatureStatus.GeneratedAt = now
+				client.signatureStatus.UsedAt = now
+				client.signatureMu.Unlock()
+			} else {
+				client.prepareSignature(prepared, body, now, attempt == attempts-1 && emptyResponses >= 2)
+			}
+		})
+		if err != nil {
+			client.recordSignatureResult("网络请求失败")
+			lastErr = err
+			var backoff *requestBackoff
+			if errors.As(err, &backoff) || ctx.Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+		content, readErr := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
+		response.Body.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(lastErr, err)
+		}
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		blockedResponse := catalogResponseBlockReason(response, content) != ""
+		if response.StatusCode != http.StatusOK || blockedResponse {
+			client.recordSignatureResult("上游拒绝或暂时无法响应")
+			lastErr = downloader.catalogResponseError(request, response, content)
+			if blockedResponse || response.StatusCode >= 400 && response.StatusCode < 500 {
+				return nil, lastErr
+			}
+			continue
+		}
+		if len(bytes.TrimSpace(content)) == 0 {
+			emptyResponses++
+			client.recordSignatureResult("上游返回空响应")
+			downloader.recordDiagnostic(diagnosticEvent{
+				Event: "hongguo.app_empty_response", Level: "warning", Source: sourceHongguo,
+				Host: request.URL.Hostname(), HTTPStatus: response.StatusCode, Protocol: response.Proto,
+				Attempt: attempt + 1, Message: "App 接口返回空响应：" + request.URL.Path,
+			})
+			lastErr = fmt.Errorf("%w（HTTP %d，正文 0 字节）；未收到明确的登录错误", errHongguoEmptyResponse, response.StatusCode)
+			if response.Header.Get("Retry-After") != "" {
+				return nil, fmt.Errorf("红果 App 接口返回空响应（HTTP %d，正文 0 字节）；上游要求稍后重试", response.StatusCode)
+			}
+			if singlePlayback && rotations < 3 && response.Header.Get("Retry-After") == "" {
+				rotations++
+				if renewed, renewErr := downloader.ensureHongguoDeviceIdentity(ctx, identity.DeviceID); renewErr == nil {
+					identity = renewed
+					query.Set("device_id", identity.DeviceID)
+					query.Set("iid", identity.InstallID)
+					attempt--
+					retryDelay = time.Second
+					continue
+				}
+			}
+			if emptyRetry && attempt+1 < attempts && response.Header.Get("Retry-After") == "" {
+				retryDelay = hongguoEmptyResponseRetryDelay * time.Duration(1<<attempt)
+				continue
+			}
+			return nil, lastErr
+		}
+		if len(content) > providerMaxBodyBytes {
+			return nil, errors.New("红果 App 接口响应超过大小限制")
+		}
+		var result map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		decoder.UseNumber()
+		if err := decoder.Decode(&result); err != nil || result == nil {
+			client.recordSignatureResult("上游响应格式异常")
+			return nil, errors.New("红果 App 接口返回格式异常")
+		}
+		code := firstNonEmpty(mapString(result, "code", "Code", "status_code"), mapString(nestedMap(result, "BaseResp"), "StatusCode"))
+		if code == "100103" && searchRequest && attempt+1 < attempts {
+			lastErr = fmt.Errorf("红果搜索暂时繁忙（%s）", code)
+			retryDelay = 120 * time.Millisecond
+			continue
+		}
+		if code != "" && code != "0" {
+			client.recordSignatureResult("上游返回业务错误")
+			return nil, fmt.Errorf("红果 App 接口暂不可用（%s）", truncate(code, 20))
+		}
+		client.recordSignatureResult("请求成功")
+		return result, nil
+	}
+	return nil, lastErr
+}

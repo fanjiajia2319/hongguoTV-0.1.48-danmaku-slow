@@ -1,0 +1,1830 @@
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'local_profiles.dart';
+import 'local_snapshot.dart';
+import 'models.dart';
+import 'playback_preferences.dart';
+import 'watch_reminder_models.dart';
+import 'download_preferences.dart';
+import 'catalog_sort.dart';
+import 'follow_state.dart';
+import 'hongguo_series.dart';
+import 'season_check.dart';
+import 'lan_sync_models.dart';
+
+part 'local_store_sync.dart';
+
+class LocalStore extends ChangeNotifier {
+  /// [pinHasher] 可注入，便于测试替换掉默认的 isolate 哈希实现。
+  LocalStore(
+    this.preferences, {
+    Future<String> Function(String, String)? pinHasher,
+    DateTime Function()? now,
+  }) : _pinHasher = pinHasher ?? hashProfilePin,
+       _now = now ?? DateTime.now {
+    _initialize();
+  }
+
+  final SharedPreferences preferences;
+  final Future<String> Function(String pin, String salt) _pinHasher;
+  final DateTime Function() _now;
+  LocalSnapshot? _snapshot;
+  LanDocument? _lanDocumentCache;
+  int _lanRevision = 0;
+  int _lanUrgentRevision = 0;
+  int get lanRevision => _lanRevision;
+  int get lanUrgentRevision => _lanUrgentRevision;
+  final Map<String, WatchEntry> _history = {};
+  final Map<String, Drama> _favorites = {};
+  final Map<String, FollowState> _followStates = {};
+  final Map<String, Drama> _seriesCandidates = {};
+  final Map<String, SeasonCheck> _seasonChecks = {};
+  final _seriesIndex = <String, List<Drama>>{};
+  final _seriesGroupIndex = <String, List<Drama>>{};
+  final _seriesCharacterIndex = <String, List<Drama>>{};
+  final _seriesEntriesCache =
+      <(String, String, String), List<HongguoSeriesEntry>>{};
+  final _seriesWatchCache = <(String, String, String), WatchEntry?>{};
+  final _seriesFollowCache = <(String, String, String), Drama?>{};
+  List<Drama>? _trackedSeriesCache;
+  Map<String, WatchEntry>? _syncedWatchCache;
+  bool _seriesIndexReady = false;
+  final _favoriteRanks = <String, int>{};
+  Future<void> _writes = Future<void>.value();
+  Future<void> flushPendingWrites() => _writes;
+  List<LocalProfile> _profiles = [];
+  String _current = 'default';
+  bool _locked = false;
+  bool _disposed = false;
+  String? _configurationError;
+  int _epoch = 0;
+  int _failures = 0;
+  bool _sourcesUnlocked = false;
+  bool _gateEnabled = false;
+  bool _gateOff = false;
+  String _gateSalt = '';
+  String _gateHash = '';
+  DateTime _retryAfter = DateTime(2000);
+
+  void _initialize() {
+    try {
+      _snapshot = LocalSnapshot(preferences);
+      final raw = _snapshot!.getString('profiles');
+      if (raw == null &&
+          (_snapshot!.getString('activeProfile') != null ||
+              _snapshot!.values.keys.any(
+                (key) => key.startsWith('profile.'),
+              ))) {
+        throw const FormatException('已有用户配置缺失');
+      }
+      _profiles = raw == null
+          ? [const LocalProfile(id: 'default', name: '管理员', admin: true)]
+          : _readProfiles(jsonDecode(raw));
+      _current = _snapshot!.getString('activeProfile') ?? 'default';
+      if (!_profiles.any((profile) => profile.id == _current)) {
+        _current = _profiles.firstWhere((profile) => profile.admin).id;
+      }
+      _configurationError = null;
+      _locked = forceLogin && profile.protected;
+      _loadSourceGate();
+      _loadLibrary();
+    } catch (_) {
+      _block('本地用户配置损坏，已锁定访问。原始记录已保留，请重新读取或从备份恢复。');
+    }
+  }
+
+  static List<LocalProfile> _readProfiles(dynamic records) {
+    final profiles = (records as List)
+        .map(
+          (row) => LocalProfile.fromJson(Map<String, dynamic>.from(row as Map)),
+        )
+        .toList();
+    if (profiles.isEmpty ||
+        profiles.length > 20 ||
+        profiles.map((profile) => profile.id).toSet().length !=
+            profiles.length ||
+        profiles.where((profile) => profile.admin).length != 1 ||
+        (profiles.length > 1 &&
+            !profiles.firstWhere((profile) => profile.admin).protected)) {
+      throw const FormatException('用户配置无效');
+    }
+    return profiles;
+  }
+
+  void _block(String message) {
+    _configurationError = message;
+    _locked = true;
+    _sourcesUnlocked = false;
+    _profiles = [
+      const LocalProfile(id: 'default', name: '配置待恢复', download: false),
+    ];
+    _current = 'default';
+    _history.clear();
+    _favorites.clear();
+    _followStates.clear();
+    _seriesCandidates.clear();
+    _seasonChecks.clear();
+    _epoch++;
+  }
+
+  void _invalidateSeries() {
+    _seriesIndexReady = false;
+    _seriesIndex.clear();
+    _seriesGroupIndex.clear();
+    _seriesCharacterIndex.clear();
+    _favoriteRanks.clear();
+    _seriesEntriesCache.clear();
+    _seriesWatchCache.clear();
+    _seriesFollowCache.clear();
+    _trackedSeriesCache = null;
+    _syncedWatchCache = null;
+  }
+
+  void _notify() {
+    _invalidateSeries();
+    if (!_disposed) notifyListeners();
+  }
+
+  String? _string(String key) => _snapshot?.getString(key);
+  bool? _bool(String key) => _snapshot?.getBool(key);
+  String _key(String key, [String? id]) =>
+      (id ?? _current) == 'default' ? key : 'profile.${id ?? _current}.$key';
+  String? get configurationError => _configurationError;
+  List<LocalProfile> get profiles => List.unmodifiable(_profiles);
+  LocalProfile get profile =>
+      _profiles.firstWhere((profile) => profile.id == _current);
+  bool get locked => _locked || _configurationError != null;
+  int get profileEpoch => _epoch;
+  bool get forceLogin {
+    if (_configurationError != null) return true;
+    final admin = _profiles.firstWhere((profile) => profile.admin);
+    return _bool('forceLogin') ?? admin.protected;
+  }
+
+  bool get canDownload => !locked && (profile.admin || profile.download);
+  bool allowsSource(String source) =>
+      !locked &&
+      SourceSite.isAvailable(source) &&
+      profile.allows(source) &&
+      (_gateOff || _sourcesUnlocked || SourceSite.isPrimary(source));
+  List<SourceSite> get sources => SourceSite.visibleValues(
+    unlocked: _gateOff || _sourcesUnlocked,
+  ).where((site) => allowsSource(site.id)).toList();
+
+  /// 默认隐藏的站源是否已解锁。解锁状态只在本次运行内有效，重启后恢复隐藏。
+  bool get sourcesUnlocked => _gateOff || _sourcesUnlocked;
+
+  /// 是否已启用站源密码锁。
+  bool get sourceGateEnabled => _gateEnabled;
+
+  bool get sourceGateConfigured => _gateSalt.isNotEmpty && _gateHash.isNotEmpty;
+
+  /// 当前是否处于「不使用密码、显示全部站源」状态。
+  bool get sourceGateOff => _gateOff;
+
+  void _loadSourceGate() {
+    final enabled = _bool('sourceGateEnabled') ?? false;
+    final off = _bool('sourceGateOff') ?? false;
+    final salt = _string('sourceGateSalt') ?? '';
+    final hash = _string('sourceGateHash') ?? '';
+    final valid =
+        enabled &&
+        RegExp(r'^[a-f0-9]{32}$').hasMatch(salt) &&
+        RegExp(r'^[a-f0-9]{64}$').hasMatch(hash);
+    _gateEnabled = valid;
+    _gateOff = !valid && off;
+    _gateSalt = valid ? salt : '';
+    _gateHash = valid ? hash : '';
+    _sourcesUnlocked = false;
+  }
+
+  Future<void> _checkSourcePin(String pin) async {
+    if (DateTime.now().isBefore(_retryAfter)) {
+      throw StateError('密码输入过于频繁，请稍后再试');
+    }
+    final actual = await _pinHasher(pin, _gateSalt);
+    var difference = actual.length ^ _gateHash.length;
+    for (var i = 0; i < actual.length && i < _gateHash.length; i++) {
+      difference |= actual.codeUnitAt(i) ^ _gateHash.codeUnitAt(i);
+    }
+    if (difference != 0) {
+      _failures++;
+      if (_failures >= 3) {
+        _retryAfter = DateTime.now().add(
+          Duration(seconds: (_failures * 2).clamp(0, 30)),
+        );
+      }
+      throw StateError('密码不正确');
+    }
+    _failures = 0;
+  }
+
+  /// 校验密码并解锁默认隐藏的站源（仅本次运行有效）。
+  Future<void> unlockSources(String pin) => _queue(() async {
+    if (_configurationError != null) throw StateError('本地用户配置损坏，请先恢复');
+    if (!_gateEnabled) throw StateError('尚未启用站源密码锁');
+    await _checkSourcePin(pin);
+    if (!_sourcesUnlocked) {
+      _sourcesUnlocked = true;
+      _notify();
+    }
+  });
+
+  /// 重新隐藏默认隐藏的站源，无需重启。
+  void lockSources() {
+    if (!_gateEnabled || !_sourcesUnlocked) return;
+    _sourcesUnlocked = false;
+    _notify();
+  }
+
+  /// 设置或更换密码锁，并立即解锁。
+  Future<void> enableSourceGate(String pin) => _queue(() async {
+    _requireAdmin();
+    final value = pin.trim();
+    if (!RegExp(r'^\d{3,12}$').hasMatch(value)) {
+      throw StateError('密码需要 3 至 12 位数字');
+    }
+    final salt = randomProfileToken();
+    final hash = await _pinHasher(value, salt);
+    await _commit({
+      'sourceGateEnabled': true,
+      'sourceGateOff': false,
+      'sourceGateSalt': salt,
+      'sourceGateHash': hash,
+    });
+    _gateEnabled = true;
+    _gateOff = false;
+    _gateSalt = salt;
+    _gateHash = hash;
+    _sourcesUnlocked = true;
+    _notify();
+  });
+
+  /// 关闭密码功能，恢复全部站源可见。
+  Future<void> disableSourceGate() => _queue(() async {
+    _requireAdmin();
+    await _commit({
+      'sourceGateEnabled': false,
+      'sourceGateOff': true,
+      'sourceGateSalt': '',
+      'sourceGateHash': '',
+    });
+    _gateEnabled = false;
+    _gateOff = true;
+    _gateSalt = '';
+    _gateHash = '';
+    _sourcesUnlocked = false;
+    _notify();
+  });
+
+  void _loadLibrary() {
+    _invalidateSeries();
+    _lanDocumentCache = null;
+    _history.clear();
+    _favorites.clear();
+    _followStates.clear();
+    _seriesCandidates.clear();
+    _seasonChecks.clear();
+    if (_configurationError != null) return;
+    for (final row in readJsonList(_string(_key('history')))) {
+      try {
+        final entry = WatchEntry.fromJson(row);
+        _history[entry.drama.id] = entry;
+      } catch (_) {}
+    }
+    for (final row in readJsonList(_string(_key('favorites')))) {
+      try {
+        final drama = Drama.fromJson(row);
+        _favorites[drama.id] = drama;
+      } catch (_) {}
+    }
+    Map<String, dynamic> states = {};
+    try {
+      states = Map<String, dynamic>.from(
+        jsonDecode(_string(_key('followStates')) ?? '{}') as Map,
+      );
+    } catch (_) {}
+    for (final drama in _favorites.values) {
+      try {
+        _followStates[drama.id] = FollowState.fromJson(
+          Map<String, dynamic>.from(states[drama.id] as Map),
+        );
+      } catch (_) {
+        _followStates[drama.id] = FollowState.initial(
+          drama,
+          _history[drama.id],
+        );
+      }
+    }
+    for (final row in readJsonList(_string(_key('seriesCandidates')))) {
+      try {
+        final drama = Drama.fromJson(row);
+        if (drama.source == SourceSite.hongguo.id) {
+          _seriesCandidates[drama.id] = drama;
+        }
+      } catch (_) {}
+    }
+    try {
+      final records = jsonDecode(_string(_key('seasonChecks')) ?? '{}');
+      if (records is Map && records.length <= 2000) {
+        for (final entry in records.entries) {
+          try {
+            final check = SeasonCheck.fromJson(
+              Map<String, dynamic>.from(entry.value as Map),
+            );
+            if (entry.key == check.anchorId) {
+              _seasonChecks[check.anchorId] = check;
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  List<WatchEntry> get history =>
+      _history.values
+          .where((entry) => allowsSource(entry.drama.source))
+          .toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  List<Drama> get favorites => _favorites.values
+      .where((drama) => allowsSource(drama.source))
+      .toList()
+      .reversed
+      .toList();
+  WatchEntry? watched(String id) {
+    WatchEntry? entry = _history[id];
+    if (entry == null) {
+      try {
+        if (_syncedWatchCache == null) {
+          final synced = <String, WatchEntry>{};
+          for (final record in lanDocument.records.values) {
+            final watch = record.followed && !record.progress.conflict
+                ? record.watch
+                : null;
+            if (watch != null &&
+                (synced[watch.drama.id] == null ||
+                    watch.updatedAt.isAfter(
+                      synced[watch.drama.id]!.updatedAt,
+                    ))) {
+              synced[watch.drama.id] = watch;
+            }
+          }
+          _syncedWatchCache = synced;
+        }
+        entry = _syncedWatchCache![id];
+      } catch (_) {}
+    }
+    return entry != null && allowsSource(entry.drama.source) ? entry : null;
+  }
+
+  bool isFavorite(String id) =>
+      _favorites[id] != null && allowsSource(_favorites[id]!.source);
+  FollowState? following(String id) =>
+      isFavorite(id) ? _followStates[id] : null;
+  String _seriesKey(Drama drama) =>
+      hongguoSeriesInfo(drama)?.key ?? normalizedSearchText(drama.title);
+
+  (String, String, String) _anchorKey(Drama drama) =>
+      (drama.source, drama.id, drama.title);
+
+  void _ensureSeriesIndex() {
+    if (_seriesIndexReady) return;
+    var rank = 0;
+    for (final id in _favorites.keys) {
+      _favoriteRanks[id] = rank++;
+    }
+    final items = <String, Drama>{
+      ..._seriesCandidates,
+      ..._favorites,
+      for (final entry in _history.values) entry.drama.id: entry.drama,
+    };
+    for (final state in _followStates.values) {
+      for (final notice in state.seriesSeasons.values) {
+        items.putIfAbsent(
+          notice.id,
+          () => Drama(
+            id: notice.id,
+            source: SourceSite.hongguo.id,
+            sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
+            title: notice.title,
+          ),
+        );
+      }
+    }
+    for (final drama in items.values) {
+      if (drama.source == SourceSite.hongguo.id && allowsSource(drama.source)) {
+        (_seriesIndex[_seriesKey(drama)] ??= []).add(drama);
+        if (drama.seriesGroupId.isNotEmpty) {
+          (_seriesGroupIndex[drama.seriesGroupId] ??= []).add(drama);
+        }
+        for (final name in hongguoSeriesCharacters(drama.description)) {
+          (_seriesCharacterIndex[name] ??= []).add(drama);
+        }
+      }
+    }
+    _seriesIndexReady = true;
+  }
+
+  List<Drama> seriesDramasFor(Drama anchor) {
+    if (anchor.source != SourceSite.hongguo.id ||
+        !allowsSource(anchor.source)) {
+      return const [];
+    }
+    _ensureSeriesIndex();
+    final candidates = <String, Drama>{
+      for (final drama in _seriesIndex[_seriesKey(anchor)] ?? const <Drama>[])
+        drama.id: drama,
+      if (anchor.seriesGroupId.isNotEmpty)
+        for (final drama
+            in _seriesGroupIndex[anchor.seriesGroupId] ?? const <Drama>[])
+          drama.id: drama,
+      for (final name in hongguoSeriesCharacters(anchor.description))
+        for (final drama in _seriesCharacterIndex[name] ?? const <Drama>[])
+          if (hongguoSameSeries(anchor, drama)) drama.id: drama,
+    }.values;
+    final current = candidates
+        .where((drama) => drama.id == anchor.id)
+        .firstOrNull;
+    return [
+      current ?? anchor,
+      ...candidates.where((drama) => drama.id != anchor.id),
+    ];
+  }
+
+  List<HongguoSeriesEntry> _seriesEntries(Drama drama) {
+    if (!allowsSource(drama.source)) return const [];
+    final key = _anchorKey(drama);
+    if (_seriesEntriesCache.length >= 2048 &&
+        !_seriesEntriesCache.containsKey(key)) {
+      _seriesEntriesCache.clear();
+    }
+    return _seriesEntriesCache.putIfAbsent(
+      key,
+      () => hongguoSeriesEntries(drama, seriesDramasFor(drama)),
+    );
+  }
+
+  bool get hideVip =>
+      _configurationError == null ? _bool(_key('hideVip')) ?? true : true;
+  String get displayMode {
+    final value = _configurationError == null ? _string('displayMode') : null;
+    return {'auto', 'television', 'standard'}.contains(value) ? value! : 'auto';
+  }
+
+  String get themeMode {
+    final value = _configurationError == null ? _string('themeMode') : null;
+    return {'light', 'dark', 'system'}.contains(value) ? value! : 'system';
+  }
+
+  bool get autoExport => !locked && (_bool('autoExport') ?? false);
+  bool get exportPosters => !locked && (_bool('exportPosters') ?? false);
+  String get source {
+    if (locked) return '';
+    final value = _string(_key('source')) ?? '';
+    return sources.any((site) => site.id == value)
+        ? value
+        : sources.firstOrNull?.id ?? '';
+  }
+
+  DownloadPreferences get downloadPreferences {
+    if (locked) return const DownloadPreferences();
+    try {
+      return DownloadPreferences.fromJson(
+        jsonDecode(_string(_key('downloadPreferences')) ?? '{}')
+            as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return const DownloadPreferences();
+    }
+  }
+
+  PlaybackPreferences get playbackPreferences {
+    if (locked) return const PlaybackPreferences();
+    try {
+      return PlaybackPreferences.fromJson(
+        jsonDecode(_string(_key('playback')) ?? '{}') as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return const PlaybackPreferences();
+    }
+  }
+
+  WatchReminderProgress get watchReminderProgress {
+    if (locked) return WatchReminderProgress();
+    try {
+      return WatchReminderProgress.fromJson(
+        jsonDecode(_string(_key('watchReminderProgress')) ?? '{}'),
+      );
+    } catch (_) {
+      return WatchReminderProgress();
+    }
+  }
+
+  Future<void> saveWatchReminderProgress(String profileId, String content) =>
+      _queue(() async {
+        if (!_profiles.any((profile) => profile.id == profileId)) return;
+        final value = WatchReminderProgress.fromJson(jsonDecode(content));
+        await _commit({
+          _key('watchReminderProgress', profileId): jsonEncode(value.toJson()),
+        }, trackSync: false);
+      });
+
+  CatalogView get catalogView {
+    if (locked) return const CatalogView();
+    try {
+      return CatalogView.fromJson(
+        Map<String, dynamic>.from(
+          jsonDecode(_string(_key('catalogView')) ?? '{}') as Map,
+        ),
+      );
+    } catch (_) {
+      return const CatalogView();
+    }
+  }
+
+  List<String> get recentSearches {
+    if (locked) return const [];
+    try {
+      return (jsonDecode(_string(_key('recentSearches')) ?? '[]') as List)
+          .whereType<String>()
+          .take(20)
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> setCatalogView(CatalogView value) =>
+      _setting(_key('catalogView'), jsonEncode(value.toJson()));
+
+  Future<void> setCatalogSource(String source, {required bool allSources}) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(source) || epoch != _epoch) {
+        throw StateError('当前用户没有此站源权限');
+      }
+      await _commit({
+        _key('source'): source,
+        _key('catalogView'): jsonEncode(
+          catalogView.copyWith(allSources: allSources).toJson(),
+        ),
+      });
+      _notify();
+    });
+  }
+
+  Future<void> rememberSearch(String text) {
+    final query = text.trim();
+    if (query.isEmpty || query.runes.length > 80) return Future.value();
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final entries = [
+        query,
+        ...recentSearches.where(
+          (entry) => normalizedSearchText(entry) != normalizedSearchText(query),
+        ),
+      ].take(20).toList();
+      await _commit({_key('recentSearches'): jsonEncode(entries)});
+      _notify();
+    });
+  }
+
+  Future<void> clearRecentSearches() => _setting(_key('recentSearches'), '[]');
+
+  Future<void> _commit(
+    Map<String, Object> changes, {
+    Iterable<String> remove = const [],
+    bool replace = false,
+    bool trackSync = true,
+    bool syncUrgent = true,
+    Set<String> clearSyncProgress = const {},
+  }) async {
+    final snapshot = _snapshot;
+    if (snapshot == null) throw StateError('请先恢复本地配置');
+    final values = replace ? <String, Object>{} : snapshot.values;
+    for (final key in remove) {
+      values.remove(key);
+    }
+    values.addAll(changes);
+    if (trackSync && !replace) {
+      _trackLanChanges(
+        values,
+        keys: {...changes.keys, ...remove},
+        clearProgress: clearSyncProgress,
+      );
+    }
+    values.putIfAbsent(
+      'profiles',
+      () => jsonEncode(_profiles.map((profile) => profile.toJson()).toList()),
+    );
+    values.putIfAbsent('activeProfile', () => _current);
+    try {
+      await snapshot.commit(values);
+      if (trackSync &&
+          !replace &&
+          {...changes.keys, ...remove}.any(
+            (key) =>
+                key == _key('favorites') ||
+                key == _key('history') ||
+                key == _key('followStates'),
+          )) {
+        _lanRevision++;
+        if (syncUrgent) _lanUrgentRevision++;
+      }
+    } on SnapshotRecoveryRequired catch (error) {
+      _block(error.toString());
+      _notify();
+      rethrow;
+    }
+  }
+
+  Future<void> _setting(String key, Object value, {bool admin = false}) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (admin) _requireAdmin();
+      if (locked || epoch != _epoch) throw StateError('当前用户已变更，请重试');
+      await _commit({key: value});
+      _notify();
+    });
+  }
+
+  Future<void> setExportPosters(bool value) =>
+      _setting('exportPosters', value, admin: true);
+  Future<void> setAutoExport(bool value) =>
+      _setting('autoExport', value, admin: true);
+  Future<void> setForceLogin(bool value) =>
+      _setting('forceLogin', value, admin: true);
+  Future<void> setHideVip(bool value) => _setting(_key('hideVip'), value);
+  Future<void> setSource(String value) {
+    if (!allowsSource(value)) return Future.error(StateError('当前用户没有此站源权限'));
+    return _setting(_key('source'), value);
+  }
+
+  Future<void> setDisplayMode(String value) =>
+      {'auto', 'television', 'standard'}.contains(value)
+      ? _setting('displayMode', value)
+      : Future.value();
+  Future<void> setThemeMode(String value) =>
+      {'light', 'dark', 'system'}.contains(value)
+      ? _setting('themeMode', value)
+      : Future.value();
+  Future<void> setPlaybackPreferences(
+    PlaybackPreferences value, {
+    bool preserveWindowsVideoCompatibility = false,
+  }) {
+    PlaybackPreferences.fromJson(value.toJson());
+    return _updatePlaybackPreferences(
+      (current) => preserveWindowsVideoCompatibility
+          ? value.copyWith(
+              windowsVideoCompatibility: current.windowsVideoCompatibility,
+            )
+          : value,
+    );
+  }
+
+  Future<void> setWindowsVideoCompatibility(bool value) =>
+      _updatePlaybackPreferences(
+        (current) => current.copyWith(windowsVideoCompatibility: value),
+      );
+
+  Future<void> _updatePlaybackPreferences(
+    PlaybackPreferences Function(PlaybackPreferences current) update,
+  ) {
+    final epoch = _epoch;
+    final key = _key('playback');
+    return _queue(() async {
+      if (locked || epoch != _epoch) throw StateError('当前用户已变更，请重试');
+      final next = update(playbackPreferences);
+      PlaybackPreferences.fromJson(next.toJson());
+      await _commit({key: jsonEncode(next.toJson())});
+      _notify();
+    });
+  }
+
+  Future<void> setDownloadPreferences(DownloadPreferences value) {
+    DownloadPreferences.fromJson(value.toJson());
+    return _setting(_key('downloadPreferences'), jsonEncode(value.toJson()));
+  }
+
+  Set<String> _seriesIds(Drama drama) => {
+    drama.id,
+    ..._seriesEntries(drama).map((entry) => entry.drama.id),
+  };
+
+  Drama? followedSeries(Drama drama) {
+    if (!allowsSource(drama.source) || _favorites.isEmpty) return null;
+    final exact = _favorites[drama.id];
+    if (exact != null) return exact;
+    final key = _anchorKey(drama);
+    if (_seriesFollowCache.containsKey(key)) return _seriesFollowCache[key];
+    if (_seriesFollowCache.length >= 2048) _seriesFollowCache.clear();
+    final ids = _seriesIds(drama);
+    Drama? result;
+    var rank = -1;
+    for (final id in ids) {
+      final favorite = _favorites[id];
+      final candidateRank = _favoriteRanks[id] ?? -1;
+      if (favorite != null &&
+          candidateRank > rank &&
+          allowsSource(favorite.source)) {
+        result = favorite;
+        rank = candidateRank;
+      }
+    }
+    _seriesFollowCache[key] = result;
+    return result;
+  }
+
+  WatchEntry? seriesWatch(Drama drama) {
+    if (!allowsSource(drama.source)) return null;
+    final key = _anchorKey(drama);
+    if (_seriesWatchCache.containsKey(key)) return _seriesWatchCache[key];
+    if (_seriesWatchCache.length >= 2048) _seriesWatchCache.clear();
+    final anchor = followedSeries(drama);
+    final record = anchor == null ? null : lanDocument.records[anchor.id];
+    final synced = record?.followed == true && !record!.progress.conflict
+        ? record.watch
+        : null;
+    if (synced != null && lanSameSeries(drama, synced.drama)) {
+      _seriesWatchCache[key] = synced;
+      return synced;
+    }
+    WatchEntry? latest;
+    for (final id in _seriesIds(drama)) {
+      final entry = _history[id];
+      if (entry != null &&
+          allowsSource(entry.drama.source) &&
+          (latest == null || entry.updatedAt.isAfter(latest.updatedAt))) {
+        latest = entry;
+      }
+    }
+    _seriesWatchCache[key] = latest;
+    return latest;
+  }
+
+  bool hasNextSeason(Drama drama) {
+    if (!allowsSource(drama.source)) return false;
+    final current = seriesWatch(drama)?.drama ?? drama;
+    final check = _seasonChecks[current.id];
+    if (check != null && check.matches(current)) {
+      if (check.nextId == null) return false;
+      return _checkedNext(current, check);
+    }
+    final entries = _seriesEntries(current);
+    final info = hongguoSeriesInfo(current);
+    return entries.any(
+      (entry) =>
+          entry.drama.id != current.id &&
+          entry.season == (info?.season ?? 1) + 1 &&
+          (info == null || entry.unit == info.unit) &&
+          hongguoVerifiedSameSeries(current, entry.drama),
+    );
+  }
+
+  bool _checkedNext(Drama anchor, SeasonCheck check) {
+    if (check.nextId == null) return false;
+    final next =
+        _seriesCandidates[check.nextId] ??
+        _favorites[check.nextId] ??
+        _history[check.nextId]?.drama;
+    if (next == null) return true;
+    if (next.id == anchor.id) return false;
+    final currentInfo = hongguoSeriesInfo(anchor);
+    final nextInfo = hongguoSeriesInfo(next);
+    return nextInfo != null &&
+        nextInfo.season == (currentInfo?.season ?? 1) + 1 &&
+        (currentInfo == null || nextInfo.unit == currentInfo.unit) &&
+        hongguoVerifiedSameSeries(anchor, next);
+  }
+
+  DateTime get seasonCheckTime => _now();
+
+  bool get seasonChecksBlocked =>
+      _seasonChecks.values.any((check) => check.isBlocked(_now()));
+
+  bool shouldCheckNextSeason(Drama anchor, {bool force = false}) {
+    if (!allowsSource(anchor.source) ||
+        anchor.source != SourceSite.hongguo.id ||
+        seasonChecksBlocked) {
+      return false;
+    }
+    final check = _seasonChecks[anchor.id];
+    if (force || check == null || !check.matches(anchor)) return true;
+    if (!check.isFresh(_now())) return true;
+    return check.nextId != null && !_checkedNext(anchor, check);
+  }
+
+  Drama _seasonLookupAnchor(Drama anchor) {
+    final stored =
+        _history[anchor.id]?.drama ??
+        _favorites[anchor.id] ??
+        _seriesCandidates[anchor.id];
+    var current = anchor;
+    if (stored != null && stored.source == anchor.source) {
+      final inputInfo = hongguoSeriesInfo(anchor);
+      final storedInfo = hongguoSeriesInfo(stored);
+      final conflicts =
+          inputInfo != null &&
+          storedInfo != null &&
+          (inputInfo.season != storedInfo.season ||
+              inputInfo.unit != storedInfo.unit);
+      current =
+          anchor.seriesGroupId.isEmpty &&
+              stored.seriesGroupId.isNotEmpty &&
+              !conflicts
+          ? anchor.merge(stored)
+          : stored.merge(anchor);
+    }
+    return current;
+  }
+
+  bool hasFreshNoNextSeason(Drama anchor) {
+    if (!allowsSource(anchor.source) ||
+        anchor.source != SourceSite.hongguo.id) {
+      return false;
+    }
+    final current = _seasonLookupAnchor(anchor);
+    final check = _seasonChecks[current.id];
+    if (check == null ||
+        !check.matches(current) ||
+        check.nextId != null ||
+        !check.complete ||
+        check.retryAt != null) {
+      return false;
+    }
+    final age = _now().toUtc().difference(check.checkedAt);
+    return !age.isNegative && age < const Duration(minutes: 10);
+  }
+
+  List<Drama> nextSeasonDramasFor(Drama anchor) {
+    if (!allowsSource(anchor.source) ||
+        anchor.source != SourceSite.hongguo.id) {
+      return const [];
+    }
+    final current = _seasonLookupAnchor(anchor);
+    final info = hongguoSeriesInfo(current);
+    bool eligible(Drama drama) {
+      final next = hongguoSeriesInfo(drama);
+      return drama.id != current.id &&
+          next != null &&
+          next.season == (info?.season ?? 1) + 1 &&
+          (info == null || next.unit == info.unit) &&
+          hongguoVerifiedSameSeries(current, drama);
+    }
+
+    final check = _seasonChecks[current.id];
+    if (check != null) {
+      if (!check.matches(current) || !check.hasFreshPositive(_now())) {
+        return [current];
+      }
+      final next =
+          _seriesCandidates[check.nextId] ??
+          _favorites[check.nextId] ??
+          _history[check.nextId]?.drama;
+      return [current, if (next != null && eligible(next)) next];
+    }
+    return [current, ...seriesDramasFor(current).where(eligible)];
+  }
+
+  List<Drama> get trackedSeries {
+    if (_trackedSeriesCache != null) return _trackedSeriesCache!;
+    final seen = <String>{};
+    final result = <Drama>[];
+    for (final drama in favorites) {
+      if (seen.contains(drama.id)) continue;
+      result.add(drama);
+      seen.addAll(_seriesIds(drama));
+    }
+    final watched = {
+      for (final drama in result) drama.id: seriesWatch(drama)?.updatedAt,
+    };
+    result.sort((a, b) {
+      final first = watched[a.id];
+      final second = watched[b.id];
+      if (first == null) return second == null ? 0 : 1;
+      if (second == null) return -1;
+      return second.compareTo(first);
+    });
+    return _trackedSeriesCache = List.unmodifiable(result);
+  }
+
+  Future<void> toggleSeriesFavorite(Drama drama) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(drama.source) || epoch != _epoch) return;
+      final entries = Map.of(_favorites);
+      final states = Map.of(_followStates);
+      final ids = _seriesIds(drama);
+      final existing = entries.keys.where(ids.contains).toList();
+      if (existing.isEmpty) {
+        if (entries.length >= 20000) throw StateError('追剧数量已达上限，请先整理追剧');
+        entries[drama.id] = drama;
+        states[drama.id] = FollowState.initial(drama, _history[drama.id]);
+      } else {
+        for (final id in existing) {
+          entries.remove(id);
+          states.remove(id);
+        }
+      }
+      await _commit({
+        _key('favorites'): jsonEncode(
+          entries.values.map((entry) => entry.toJson()).toList(),
+        ),
+        _key('followStates'): _encodeFollowStates(states),
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> toggleFavorite(Drama drama) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(drama.source) || epoch != _epoch) return;
+      final entries = Map.of(_favorites);
+      final states = Map.of(_followStates);
+      if (entries.containsKey(drama.id)) {
+        entries.remove(drama.id);
+        states.remove(drama.id);
+      } else {
+        if (entries.length >= 20000) throw StateError('追剧数量已达上限，请先整理追剧');
+        entries[drama.id] = drama;
+        states[drama.id] = FollowState.initial(drama, _history[drama.id]);
+      }
+      await _commit({
+        _key('favorites'): jsonEncode(
+          entries.values.map((entry) => entry.toJson()).toList(),
+        ),
+        _key('followStates'): _encodeFollowStates(states),
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  String _encodeFollowStates(Map<String, FollowState> states) => jsonEncode({
+    for (final entry in states.entries) entry.key: entry.value.toJson(),
+  });
+
+  Future<void> setFollowStatus(Drama drama, FollowStatus status) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(drama.source) || epoch != _epoch) return;
+      if (!_favorites.containsKey(drama.id) && _favorites.length >= 20000) {
+        throw StateError('追剧数量已达上限，请先整理追剧');
+      }
+      final current = _favorites[drama.id]?.merge(drama) ?? drama;
+      final entries = Map.of(_favorites)..[drama.id] = current;
+      final state =
+          (_followStates[drama.id] ??
+                  FollowState.initial(current, _history[drama.id]))
+              .observe(current)
+              .withStatus(status);
+      final states = Map.of(_followStates)..[drama.id] = state;
+      await _commit({
+        _key('favorites'): jsonEncode(
+          entries.values.map((entry) => entry.toJson()).toList(),
+        ),
+        _key('followStates'): _encodeFollowStates(states),
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> markUpdatesRead(String id) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!isFavorite(id) || epoch != _epoch) return;
+      final states = Map.of(_followStates)
+        ..[id] = _followStates[id]!.markRead();
+      await _commit({_key('followStates'): _encodeFollowStates(states)});
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> markSeriesSeasonRead(String id, String seasonId) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!isFavorite(id) || epoch != _epoch) return;
+      final current = _followStates[id]!;
+      final updated = current.markSeriesSeasonRead(seasonId);
+      if (identical(current, updated)) return;
+      final states = Map.of(_followStates)..[id] = updated;
+      await _commit({_key('followStates'): _encodeFollowStates(states)});
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> saveWatch(WatchEntry entry) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(entry.drama.source) || epoch != _epoch) return;
+      final previous = _history[entry.drama.id]?.drama;
+      final current = previous == null
+          ? entry
+          : WatchEntry(
+              drama: previous.merge(entry.drama),
+              episode: entry.episode,
+              position: entry.position,
+              duration: entry.duration,
+              updatedAt: entry.updatedAt,
+            );
+      final entries = Map.of(_history)..[entry.drama.id] = current;
+      final sorted = entries.values.toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      final following = _followStates[entry.drama.id];
+      final states = Map.of(_followStates);
+      final favorites = Map.of(_favorites);
+      if (following != null) {
+        states[entry.drama.id] = following.afterPlayback(current);
+        favorites[entry.drama.id] = favorites[entry.drama.id]!.merge(
+          current.drama,
+        );
+      }
+      await _commit({
+        _key('history'): jsonEncode(
+          sorted.take(300).map((entry) => entry.toJson()).toList(),
+        ),
+        if (following != null) ...{
+          _key('followStates'): _encodeFollowStates(states),
+          _key('favorites'): jsonEncode(
+            favorites.values.map((entry) => entry.toJson()).toList(),
+          ),
+        },
+      }, syncUrgent: false);
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  WatchEntry? mediaWatched(String id) {
+    if (!canDownload) return null;
+    try {
+      final data = jsonDecode(_string(_key('mediaHistory')) ?? '{}') as Map;
+      final entry = data[id] == null
+          ? null
+          : WatchEntry.fromJson(Map<String, dynamic>.from(data[id] as Map));
+      return entry != null && allowsSource(entry.drama.source) ? entry : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveMediaWatch(String id, WatchEntry entry) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!canDownload ||
+          !allowsSource(entry.drama.source) ||
+          epoch != _epoch) {
+        return;
+      }
+      final data = jsonDecode(_string(_key('mediaHistory')) ?? '{}') as Map;
+      data.remove(id);
+      data[id] = entry.toJson();
+      while (data.length > 300) {
+        data.remove(data.keys.first);
+      }
+      await _commit({_key('mediaHistory'): jsonEncode(data)});
+    });
+  }
+
+  Future<void> clearHistory() {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      await _commit(
+        {},
+        remove: [_key('history')],
+        clearSyncProgress: {..._history.keys, ...lanDocument.records.keys},
+      );
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> removeHistory(String id) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (watched(id) == null || epoch != _epoch) return;
+      final entries = Map.of(_history)..remove(id);
+      await _commit(
+        {
+          _key('history'): jsonEncode(
+            entries.values.map((entry) => entry.toJson()).toList(),
+          ),
+        },
+        clearSyncProgress: {id},
+      );
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> refreshDrama(Drama drama) =>
+      _refreshDramas([drama], cacheSeriesCandidates: false);
+
+  Future<void> refreshDramas(Iterable<Drama> dramas) =>
+      _refreshDramas(dramas, cacheSeriesCandidates: true);
+
+  Future<void> applySeasonCheck({
+    required Drama followed,
+    required Drama anchor,
+    required Drama resolvedAnchor,
+    required Drama? next,
+    required bool complete,
+    required bool Function() isCurrent,
+    DateTime? retryAt,
+    bool blocked = false,
+  }) {
+    final epoch = _epoch;
+    final favoriteId = followedSeries(followed)?.id;
+    final expected = SeasonCheck.observed(
+      anchor,
+      checkedAt: _now(),
+      nextId: null,
+      complete: false,
+    );
+    bool current() {
+      if (_disposed ||
+          locked ||
+          epoch != _epoch ||
+          !isCurrent() ||
+          !allowsSource(anchor.source) ||
+          favoriteId == null ||
+          !_favorites.containsKey(favoriteId)) {
+        return false;
+      }
+      final favorite = _favorites[favoriteId]!;
+      return expected.matches(seriesWatch(favorite)?.drama ?? favorite);
+    }
+
+    return _queue(() async {
+      if (!current()) return;
+      if (resolvedAnchor.id != anchor.id ||
+          resolvedAnchor.source != anchor.source) {
+        throw StateError('续季检查返回了其他剧集');
+      }
+      final mergedAnchor = anchor.merge(resolvedAnchor);
+      final info = hongguoSeriesInfo(mergedAnchor);
+      final nextInfo = next == null ? null : hongguoSeriesInfo(next);
+      if (next != null &&
+          (next.id == anchor.id ||
+              nextInfo == null ||
+              nextInfo.season != (info?.season ?? 1) + 1 ||
+              info != null && nextInfo.unit != info.unit ||
+              !hongguoVerifiedSameSeries(mergedAnchor, next))) {
+        throw StateError('续季检查结果缺少连续季关系');
+      }
+      final changes = await _libraryChanges([
+        mergedAnchor,
+        ?next,
+      ], cacheSeriesCandidates: true);
+      if (!current()) return;
+      if (complete || next != null) {
+        final states = changes['followStates'] == null
+            ? Map.of(_followStates)
+            : {
+                for (final entry
+                    in (jsonDecode(changes['followStates']! as String) as Map)
+                        .entries)
+                  entry.key as String: FollowState.fromJson(
+                    Map<String, dynamic>.from(entry.value as Map),
+                  ),
+              };
+        final state = states[favoriteId];
+        if (state != null) {
+          final seasons = Map.of(state.seriesSeasons)
+            ..removeWhere(
+              (id, notice) =>
+                  notice.season == (info?.season ?? 1) + 1 &&
+                  (info == null || notice.unit == info.unit) &&
+                  id != next?.id,
+            );
+          states[favoriteId!] = state.copyWith(seriesSeasons: seasons);
+          final encoded = _encodeFollowStates(states);
+          if (encoded != _encodeFollowStates(_followStates)) {
+            changes['followStates'] = encoded;
+          } else {
+            changes.remove('followStates');
+          }
+        }
+      }
+      final now = _now().toUtc();
+      var check = SeasonCheck.observed(
+        mergedAnchor,
+        checkedAt: now,
+        nextId: next?.id,
+        complete: complete,
+      );
+      if (next == null && !complete) {
+        final previous = _seasonChecks[mergedAnchor.id];
+        if (previous != null &&
+            previous.matches(mergedAnchor) &&
+            previous.nextId != null &&
+            _checkedNext(mergedAnchor, previous)) {
+          check = previous;
+        }
+        final earliest = now.add(const Duration(seconds: 30));
+        check = check.retrying(
+          retryAt: retryAt != null && retryAt.isAfter(earliest)
+              ? retryAt
+              : earliest,
+          blocked: blocked,
+        );
+      }
+      final checks = Map.of(_seasonChecks)..[mergedAnchor.id] = check;
+      final sorted = checks.values.toList()
+        ..sort(
+          (a, b) =>
+              (b.retryAt ?? b.checkedAt).compareTo(a.retryAt ?? a.checkedAt),
+        );
+      changes['seasonChecks'] = jsonEncode({
+        for (final entry in sorted.take(2000)) entry.anchorId: entry.toJson(),
+      });
+      if (!current()) return;
+      await _commit({
+        for (final entry in changes.entries) _key(entry.key): entry.value,
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<Map<String, Object>> _libraryChanges(
+    List<Drama> updates, {
+    required bool cacheSeriesCandidates,
+  }) async {
+    final input = (
+      updates,
+      Map.of(_favorites),
+      Map.of(_history),
+      Map.of(_followStates),
+      Map.of(_seriesCandidates),
+      sources.map((source) => source.id).toSet(),
+      cacheSeriesCandidates,
+    );
+    final largeMerge =
+        updates.length > 128 ||
+        _favorites.length + _history.length + _seriesCandidates.length > 256 ||
+        updates.length * _favorites.length > 256;
+    return largeMerge
+        ? await compute(_mergeLibraryDramas, input)
+        : _mergeLibraryDramas(input);
+  }
+
+  Future<void> _refreshDramas(
+    Iterable<Drama> dramas, {
+    required bool cacheSeriesCandidates,
+  }) {
+    final epoch = _epoch;
+    final updates = dramas.toList();
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final changes = await _libraryChanges(
+        updates,
+        cacheSeriesCandidates: cacheSeriesCandidates,
+      );
+      if (_disposed || locked || epoch != _epoch) return;
+      if (changes.isEmpty) return;
+      await _commit({
+        for (final entry in changes.entries) _key(entry.key): entry.value,
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  void _requireAdmin() {
+    if (locked || !profile.admin) throw StateError('仅管理员可以修改此设置');
+  }
+
+  Future<void> _checkPin(LocalProfile target, String pin) async {
+    if (DateTime.now().isBefore(_retryAfter)) {
+      throw StateError('密码输入过于频繁，请稍后再试');
+    }
+    if (!await checkProfilePin(target, pin)) {
+      _failures++;
+      if (_failures >= 3) {
+        _retryAfter = DateTime.now().add(
+          Duration(seconds: (_failures * 2).clamp(0, 30)),
+        );
+      }
+      throw StateError('密码不正确');
+    }
+    _failures = 0;
+  }
+
+  Future<void> switchProfile(String id, {String pin = ''}) => _queue(() async {
+    if (_configurationError != null) throw StateError('本地用户配置损坏，请先恢复');
+    final target = _profiles.firstWhere((profile) => profile.id == id);
+    await _checkPin(target, pin);
+    await _commit({'activeProfile': id});
+    _current = id;
+    _locked = false;
+    _loadLibrary();
+    _epoch++;
+    _notify();
+  });
+  void lock() {
+    if (!profile.protected) return;
+    _locked = true;
+    _epoch++;
+    _notify();
+  }
+
+  Future<void> saveProfile({
+    String? id,
+    required String name,
+    required List<String> sources,
+    required bool download,
+    String? pin,
+  }) => _queue(() async {
+    _requireAdmin();
+    final old = _profiles.where((profile) => profile.id == id).firstOrNull;
+    final targetId = old?.id ?? randomProfileToken();
+    final cleanName = name.trim();
+    if (cleanName.isEmpty || cleanName.length > 40) {
+      throw StateError('用户名需要 1 至 40 个字符');
+    }
+    if (sources.any((source) => !SourceSite.isKnown(source))) {
+      throw StateError('站源无效');
+    }
+    if (targetId != 'default' &&
+        !_profiles.firstWhere((profile) => profile.admin).protected) {
+      throw StateError('请先为管理员设置密码，再创建或修改其他用户');
+    }
+    if (old == null && _profiles.length >= 20) {
+      throw StateError('最多支持 20 个本地用户');
+    }
+    var salt = old?.salt ?? '', hash = old?.pinHash ?? '';
+    if (pin != null) {
+      if (pin.isEmpty) {
+        if (targetId == 'default' && _profiles.length > 1) {
+          throw StateError('存在其他用户时不能取消管理员密码');
+        }
+        salt = '';
+        hash = '';
+      } else {
+        if (pin.length < 6 || pin.length > 128) {
+          throw StateError('密码需要 6 至 128 个字符');
+        }
+        salt = randomProfileToken();
+        hash = await _pinHasher(pin, salt);
+      }
+    }
+    _requireAdmin();
+    final updated = LocalProfile(
+      id: targetId,
+      name: cleanName,
+      admin: targetId == 'default',
+      sources: sources.toSet().toList(),
+      download: download,
+      salt: salt,
+      pinHash: hash,
+    );
+    final profiles =
+        [
+          for (final profile in _profiles)
+            if (profile.id != targetId) profile,
+          updated,
+        ]..sort(
+          (a, b) => a.admin
+              ? -1
+              : b.admin
+              ? 1
+              : a.name.compareTo(b.name),
+        );
+    await _commit({
+      'profiles': jsonEncode(
+        profiles.map((profile) => profile.toJson()).toList(),
+      ),
+    });
+    _profiles = profiles;
+    _notify();
+  });
+  Future<void> deleteProfile(String id) => _queue(() async {
+    _requireAdmin();
+    if (id == 'default') throw StateError('不能删除管理员');
+    final profiles = _profiles.where((profile) => profile.id != id).toList();
+    await _commit({
+      'profiles': jsonEncode(
+        profiles.map((profile) => profile.toJson()).toList(),
+      ),
+    }, remove: LocalSnapshot.libraryKeys.map((key) => _key(key, id)));
+    _profiles = profiles;
+    _notify();
+  });
+
+  Future<String> exportBackup() async {
+    await _writes.catchError((Object _) {});
+    _requireAdmin();
+    final content = jsonEncode({
+      'schema': 1,
+      'app': 'zhenguojian',
+      'profiles': _profiles.map((profile) => profile.toJson()).toList(),
+      'displayMode': displayMode,
+      'themeMode': themeMode,
+      'autoExport': autoExport,
+      'exportPosters': exportPosters,
+      'forceLogin': forceLogin,
+      'libraries': {
+        for (final profile in _profiles)
+          profile.id: {
+            ..._backupFollowSync(profile.id),
+            'history': readJsonList(_string(_key('history', profile.id))),
+            'favorites': readJsonList(_string(_key('favorites', profile.id))),
+            'followStates': jsonDecode(
+              _string(_key('followStates', profile.id)) ?? '{}',
+            ),
+            'seriesCandidates': readJsonList(
+              _string(_key('seriesCandidates', profile.id)),
+            ),
+            'mediaHistory': jsonDecode(
+              _string(_key('mediaHistory', profile.id)) ?? '{}',
+            ),
+            'source': _string(_key('source', profile.id)) ?? '',
+            'hideVip': _bool(_key('hideVip', profile.id)) ?? true,
+            'playback': jsonDecode(
+              _string(_key('playback', profile.id)) ?? '{}',
+            ),
+            'watchReminderProgress': jsonDecode(
+              _string(_key('watchReminderProgress', profile.id)) ?? '{}',
+            ),
+            'downloadPreferences': jsonDecode(
+              _string(_key('downloadPreferences', profile.id)) ?? '{}',
+            ),
+            'catalogView': jsonDecode(
+              _string(_key('catalogView', profile.id)) ?? '{}',
+            ),
+            'recentSearches': jsonDecode(
+              _string(_key('recentSearches', profile.id)) ?? '[]',
+            ),
+          },
+      },
+    });
+    if (utf8.encode(content).length > 8 * 1024 * 1024) {
+      throw StateError('备份超过 8 MiB 保存上限，请先整理记录；尚未写出备份文件');
+    }
+    validateBackup(content);
+    return content;
+  }
+
+  Map<String, dynamic> validateBackup(String content) {
+    if (utf8.encode(content).length > 8 * 1024 * 1024) {
+      throw const FormatException('备份文件过大');
+    }
+    final data = jsonDecode(content) as Map<String, dynamic>;
+    if (data['schema'] != 1 || data['app'] != 'zhenguojian') {
+      throw const FormatException('不支持的备份格式');
+    }
+    final profiles = _readProfiles(data['profiles']);
+    if (data.containsKey('themeMode') &&
+        !{'light', 'dark', 'system'}.contains(data['themeMode'])) {
+      throw const FormatException('备份主题设置无效');
+    }
+    if (data.containsKey('forceLogin') && data['forceLogin'] is! bool) {
+      throw const FormatException('备份登录设置无效');
+    }
+    final libraries = data['libraries'] as Map;
+    for (final profile in profiles) {
+      final library = libraries[profile.id] as Map;
+      final history = library['history'] as List,
+          favorites = library['favorites'] as List;
+      final media = library['mediaHistory'] as Map? ?? {};
+      if (media.length > 300 ||
+          history.length > 300 ||
+          favorites.length > 20000) {
+        throw const FormatException('备份记录过多');
+      }
+      for (final row in [...history, ...media.values]) {
+        WatchEntry.fromJson(Map<String, dynamic>.from(row as Map));
+      }
+      for (final row in favorites) {
+        Drama.fromJson(Map<String, dynamic>.from(row as Map));
+      }
+      final states = library['followStates'] as Map? ?? {};
+      final seriesCandidates = library['seriesCandidates'] as List? ?? [];
+      final favoriteIds = favorites.map((row) => (row as Map)['id']).toSet();
+      _readBackupFollowSync(library);
+      if (states.length > 20000 ||
+          states.keys.any((id) => id is! String || !favoriteIds.contains(id))) {
+        throw const FormatException('备份追剧状态无效');
+      }
+      for (final row in states.values) {
+        FollowState.fromJson(Map<String, dynamic>.from(row as Map));
+      }
+      if (seriesCandidates.length > 2000) {
+        throw const FormatException('备份系列候选过多');
+      }
+      for (final row in seriesCandidates) {
+        Drama.fromJson(Map<String, dynamic>.from(row as Map));
+      }
+      if (library['hideVip'] is! bool || library['source'] is! String) {
+        throw const FormatException('备份设置无效');
+      }
+      PlaybackPreferences.fromJson(
+        Map<String, dynamic>.from(library['playback'] as Map? ?? {}),
+      );
+      WatchReminderProgress.fromJson(library['watchReminderProgress']);
+      DownloadPreferences.fromJson(
+        Map<String, dynamic>.from(library['downloadPreferences'] as Map? ?? {}),
+      );
+      CatalogView.fromJson(
+        Map<String, dynamic>.from(library['catalogView'] as Map? ?? {}),
+      );
+      final searches = library['recentSearches'] as List? ?? [];
+      if (searches.length > 20 ||
+          searches.any(
+            (value) => value is! String || value.runes.length > 80,
+          )) {
+        throw const FormatException('备份搜索记录无效');
+      }
+    }
+    return data;
+  }
+
+  Future<void> _installBackup(Map<String, dynamic> data) async {
+    final profiles = _readProfiles(data['profiles']);
+    final values = <String, Object>{
+      'profiles': jsonEncode(
+        profiles.map((profile) => profile.toJson()).toList(),
+      ),
+      'activeProfile': profiles.firstWhere((profile) => profile.admin).id,
+      'displayMode':
+          {'auto', 'television', 'standard'}.contains(data['displayMode'])
+          ? data['displayMode'] as String
+          : 'auto',
+      'themeMode': data['themeMode'] as String? ?? themeMode,
+      'autoExport': data['autoExport'] == true,
+      'exportPosters': data['exportPosters'] == true,
+      'forceLogin': data['forceLogin'] is bool
+          ? data['forceLogin'] as bool
+          : profiles.firstWhere((profile) => profile.admin).protected,
+    };
+    final libraries = data['libraries'] as Map;
+    for (final profile in profiles) {
+      final library = libraries[profile.id] as Map;
+      final syncRecords = _readBackupFollowSync(library);
+      values.addAll({
+        if (syncRecords != null)
+          _key('lanRecords', profile.id): jsonEncode(
+            LanDocument(replica: lanID(), records: syncRecords).toJson(),
+          ),
+        _key('history', profile.id): jsonEncode(library['history']),
+        _key('favorites', profile.id): jsonEncode(library['favorites']),
+        _key('followStates', profile.id): jsonEncode(
+          library['followStates'] ?? {},
+        ),
+        _key('seriesCandidates', profile.id): jsonEncode(
+          library['seriesCandidates'] ?? [],
+        ),
+        _key('mediaHistory', profile.id): jsonEncode(
+          library['mediaHistory'] ?? {},
+        ),
+        _key('source', profile.id): library['source'] as String,
+        _key('hideVip', profile.id): library['hideVip'] as bool,
+        _key('playback', profile.id): jsonEncode(library['playback'] ?? {}),
+        _key('watchReminderProgress', profile.id): jsonEncode(
+          library['watchReminderProgress'] ?? {},
+        ),
+        _key('downloadPreferences', profile.id): jsonEncode(
+          library['downloadPreferences'] ?? {},
+        ),
+        _key('catalogView', profile.id): jsonEncode(
+          library['catalogView'] ?? {},
+        ),
+        _key('recentSearches', profile.id): jsonEncode(
+          library['recentSearches'] ?? [],
+        ),
+      });
+    }
+    await _commit(values, replace: true);
+    _profiles = profiles;
+    _current = profiles.firstWhere((profile) => profile.admin).id;
+    _configurationError = null;
+    _locked = forceLogin && profile.protected;
+    _loadSourceGate();
+    _loadLibrary();
+    _epoch++;
+    _notify();
+  }
+
+  Future<void> importBackup(String content) => _queue(() async {
+    _requireAdmin();
+    await _installBackup(validateBackup(content));
+  });
+
+  Future<void> recoverBackup(String content, {required String pin}) =>
+      _queue(() async {
+        if (_configurationError == null) throw StateError('请从设置中恢复备份');
+        final data = validateBackup(content);
+        LocalProfile? originalAdmin;
+        try {
+          final raw = preferences.getString(LocalSnapshot.storageKey);
+          final values = raw == null
+              ? null
+              : (jsonDecode(raw) as Map)['values'] as Map;
+          final records =
+              jsonDecode(
+                    (values?['profiles'] as String?) ??
+                        preferences.getString('profiles') ??
+                        '[]',
+                  )
+                  as List;
+          for (final row in records) {
+            if (row is Map && row['admin'] == true) {
+              originalAdmin = LocalProfile.fromJson(
+                Map<String, dynamic>.from(row),
+              );
+            }
+          }
+        } catch (_) {}
+        final backupAdmin = _readProfiles(
+          data['profiles'],
+        ).firstWhere((profile) => profile.admin);
+        final verifier = originalAdmin?.protected == true
+            ? originalAdmin!
+            : backupAdmin;
+        if (!verifier.protected) throw StateError('无法验证管理员身份，请使用包含管理员密码的备份恢复');
+        await _checkPin(verifier, pin);
+        _snapshot ??= LocalSnapshot.empty(preferences);
+        await _installBackup(data);
+      });
+
+  String exportRecoveryData() {
+    if (_configurationError == null) throw StateError('请从设置中导出备份');
+    return jsonEncode({
+      'app': 'zhenguojian',
+      'recovery': true,
+      'values': {
+        for (final key in preferences.getKeys())
+          if (LocalSnapshot.owns(key) || key == LocalSnapshot.storageKey)
+            key: preferences.get(key),
+      },
+    });
+  }
+
+  Future<void> reload() => _queue(() async {
+    final previousProfiles = _configurationError == null
+        ? _string('profiles')
+        : null;
+    final previousId = _current;
+    final previousLocked = locked;
+    await preferences.reload();
+    _initialize();
+    if (_configurationError == null &&
+        previousProfiles == _string('profiles') &&
+        previousId == _current) {
+      _locked = previousLocked;
+    } else {
+      _epoch++;
+    }
+    _notify();
+  });
+
+  Future<void> _queue(Future<void> Function() action) {
+    _writes = _writes.catchError((Object _) {}).then((_) => action());
+    return _writes;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+
+Map<String, Object> _mergeLibraryDramas(_LibraryMergeInput input) {
+  final (
+    updates,
+    originalFavorites,
+    originalHistory,
+    originalStates,
+    originalCandidates,
+    allowedSources,
+    cacheSeriesCandidates,
+  ) = input;
+  String encodeStates(Map<String, FollowState> states) => jsonEncode({
+    for (final entry in states.entries) entry.key: entry.value.toJson(),
+  });
+  final changes = <String, Object>{};
+  final favorites = Map.of(originalFavorites);
+  final history = Map.of(originalHistory);
+  final states = Map.of(originalStates);
+  final seriesCandidates = Map.of(originalCandidates);
+  for (final drama in updates) {
+    if (!allowedSources.contains(drama.source)) continue;
+    if (cacheSeriesCandidates && drama.source == SourceSite.hongguo.id) {
+      seriesCandidates[drama.id] = (seriesCandidates[drama.id] ?? drama).merge(
+        drama,
+      );
+    }
+    final favorite = favorites[drama.id];
+    if (favorite != null) {
+      favorites[drama.id] = favorite.merge(drama);
+      states[drama.id] = states[drama.id]!.observe(favorites[drama.id]!);
+    }
+    final watched = history[drama.id];
+    if (watched != null) {
+      history[drama.id] = WatchEntry(
+        drama: watched.drama.merge(drama),
+        episode: watched.episode,
+        position: watched.position,
+        duration: watched.duration,
+        updatedAt: watched.updatedAt,
+      );
+    }
+  }
+  final candidates = <String, Drama>{
+    for (final entry in history.values) entry.drama.id: entry.drama,
+    ...favorites,
+    for (final drama in updates)
+      if (allowedSources.contains(drama.source)) drama.id: drama,
+  };
+  for (final state in states.values) {
+    for (final notice in state.seriesSeasons.values) {
+      candidates.putIfAbsent(
+        notice.id,
+        () => Drama(
+          id: notice.id,
+          source: SourceSite.hongguo.id,
+          sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
+          title: notice.title,
+        ),
+      );
+    }
+  }
+  final favoriteIds = favorites.keys.toSet();
+  for (final favorite in favorites.values) {
+    if (favorite.source != SourceSite.hongguo.id ||
+        states[favorite.id] == null) {
+      continue;
+    }
+    states[favorite.id] = observeHongguoSeriesSeasons(
+      anchor: favorite,
+      state: states[favorite.id]!,
+      candidates: candidates.values,
+      favoriteIds: favoriteIds,
+    );
+  }
+  final favoriteJson = jsonEncode(
+    favorites.values.map((entry) => entry.toJson()).toList(),
+  );
+  final historyJson = jsonEncode(
+    history.values.map((entry) => entry.toJson()).toList(),
+  );
+  final statesJson = encodeStates(states);
+  final seriesCandidateJson = cacheSeriesCandidates
+      ? jsonEncode(
+          (seriesCandidates.values.toList()
+                ..sort((a, b) => a.id.compareTo(b.id)))
+              .take(2000)
+              .map((entry) => entry.toJson())
+              .toList(),
+        )
+      : null;
+  if (favoriteJson !=
+      jsonEncode(
+        originalFavorites.values.map((entry) => entry.toJson()).toList(),
+      )) {
+    changes['favorites'] = favoriteJson;
+  }
+  if (historyJson !=
+      jsonEncode(
+        originalHistory.values.map((entry) => entry.toJson()).toList(),
+      )) {
+    changes['history'] = historyJson;
+  }
+  if (statesJson != encodeStates(originalStates)) {
+    changes['followStates'] = statesJson;
+  }
+  if (seriesCandidateJson != null &&
+      seriesCandidateJson !=
+          jsonEncode(
+            (originalCandidates.values.toList()
+                  ..sort((a, b) => a.id.compareTo(b.id)))
+                .take(2000)
+                .map((entry) => entry.toJson())
+                .toList(),
+          )) {
+    changes['seriesCandidates'] = seriesCandidateJson;
+  }
+  return changes;
+}
+
+typedef _LibraryMergeInput = (
+  List<Drama>,
+  Map<String, Drama>,
+  Map<String, WatchEntry>,
+  Map<String, FollowState>,
+  Map<String, Drama>,
+  Set<String>,
+  bool,
+);

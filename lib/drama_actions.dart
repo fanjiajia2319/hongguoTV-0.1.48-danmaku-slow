@@ -1,0 +1,125 @@
+import 'package:flutter/material.dart';
+
+import 'local_store.dart';
+import 'core_bridge.dart';
+import 'series_browser_screen.dart';
+import 'player_screen.dart';
+import 'models.dart';
+import 'widgets.dart';
+
+Future<void> showDramaActions(
+  BuildContext context, {
+  required Drama drama,
+  required LocalStore store,
+  required AppRepository repository,
+  VoidCallback? onContinue,
+  VoidCallback? onDownload,
+  VoidCallback? onSelect,
+  bool history = false,
+}) async {
+  final epoch = store.profileEpoch;
+  final following = store.followedSeries(drama);
+  final choices = <(String, String, IconData)>[
+    if (onContinue != null && store.seriesWatch(drama) != null)
+      ('continue', '继续观看', Icons.play_arrow_rounded),
+    if (drama.source == SourceSite.hongguo.id)
+      ('seasons', '搜索其他季', Icons.video_library_outlined),
+    ('favorite', following == null ? '加入追剧' : '取消追剧', Icons.bookmark_outline),
+    if (onDownload != null && store.canDownload)
+      ('download', '下载选集', Icons.download_outlined),
+    if (onSelect != null && store.canDownload)
+      ('select', '多选下载', Icons.checklist_rounded),
+    if (history && store.watched(drama.id) != null)
+      ('removeHistory', '删除这条观看记录', Icons.history_toggle_off),
+  ];
+  final choice = await showDialog<String>(
+    context: context,
+    builder: (context) => SimpleDialog(
+      title: Text(drama.title, maxLines: 2, overflow: TextOverflow.ellipsis),
+      children: [
+        for (final entry in choices.indexed)
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, entry.$2.$1),
+            child: Row(
+              children: [
+                Icon(entry.$2.$3, size: 22),
+                const SizedBox(width: 14),
+                Expanded(child: Text(entry.$2.$2)),
+              ],
+            ),
+          ),
+      ],
+    ),
+  );
+  if (choice == null ||
+      !context.mounted ||
+      epoch != store.profileEpoch ||
+      !store.allowsSource(drama.source)) {
+    return;
+  }
+  switch (choice) {
+    case 'continue':
+      onContinue?.call();
+    case 'seasons':
+      final selection = await Navigator.of(context)
+          .push<SeriesEpisodeSelection>(
+            MaterialPageRoute(
+              builder: (_) => SeriesBrowserScreen(
+                anchor: drama,
+                repository: repository,
+                store: store,
+              ),
+            ),
+          );
+      if (selection == null ||
+          !context.mounted ||
+          epoch != store.profileEpoch ||
+          store.locked ||
+          !store.allowsSource(selection.detail.drama.source))
+        return;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => PlayerScreen(
+            detail: selection.detail,
+            initialIndex: selection.index,
+            initialPosition: selection.position,
+            repository: repository,
+            store: store,
+          ),
+        ),
+      );
+    case 'favorite':
+      await saveUserChange(context, () => store.toggleSeriesFavorite(drama));
+    case 'download':
+      if (store.canDownload) onDownload?.call();
+    case 'select':
+      if (store.canDownload) onSelect?.call();
+    case 'removeHistory':
+      await saveUserChange(context, () => store.removeHistory(drama.id));
+  }
+}
+
+class DramaActionButton extends StatelessWidget {
+  const DramaActionButton({
+    super.key,
+    required this.drama,
+    required this.onPressed,
+  });
+  final Drama drama;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => IconButton.filledTonal(
+    key: ValueKey('drama-actions-${drama.id}'),
+    tooltip: '${drama.title} · 更多操作',
+    onPressed: onPressed,
+    icon: const Icon(Icons.more_horiz_rounded, size: 20),
+    style: IconButton.styleFrom(
+      backgroundColor: Colors.black.withValues(alpha: .64),
+      foregroundColor: Colors.white,
+      minimumSize: const Size(40, 40),
+      padding: const EdgeInsets.all(8),
+      visualDensity: VisualDensity.compact,
+    ),
+  );
+}
