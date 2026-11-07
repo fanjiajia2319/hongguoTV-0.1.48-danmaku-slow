@@ -176,7 +176,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   bool get _realtime => widget.television || _mobile;
   double get _realtimeSpeed {
     final speed = widget.speed ?? (_mobile ? 1.15 : 1.0);
-    return (speed.isFinite ? speed.clamp(.25, 2.0) : (_mobile ? 1.15 : 1.0)) *
+    return (speed.isFinite ? speed.clamp(.1, 2.0) : (_mobile ? 1.15 : 1.0)) *
         danmakuBaselineSpeed;
   }
 
