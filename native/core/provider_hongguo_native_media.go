@@ -29,6 +29,27 @@ const hongguoVideoModelPath = "/novel/player/multi_video_model/v1/"
 // 允许跟随 fallback_api 的域名后缀，避免把请求带往第三方。
 var hongguoFallbackDomains = []string{"fqnovel.com", "snssdk.com"}
 
+type hongguoMediaSelectionError struct {
+	variants         int
+	unsupportedCodec int
+	unavailableURL   int
+	invalidVariant   int
+}
+
+func (failure *hongguoMediaSelectionError) Error() string {
+	reasons := make([]string, 0, 3)
+	if failure.unsupportedCodec > 0 {
+		reasons = append(reasons, fmt.Sprintf("ByteVC2 编码不支持 %d 档", failure.unsupportedCodec))
+	}
+	if failure.unavailableURL > 0 {
+		reasons = append(reasons, fmt.Sprintf("媒体地址缺失或无法解析 %d 档", failure.unavailableURL))
+	}
+	if failure.invalidVariant > 0 {
+		reasons = append(reasons, fmt.Sprintf("档位数据格式异常 %d 档", failure.invalidVariant))
+	}
+	return fmt.Sprintf("红果 App 未返回可播放媒体（共 %d 档；%s）", failure.variants, strings.Join(reasons, "；"))
+}
+
 // 媒体 URL 解密的固定常量段（64 字节）。
 var hongguoSpadeURLConstants = hgUnhex(
 	"4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524" +
@@ -86,42 +107,7 @@ func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoI
 			return providerMedia{}, errors.New("红果 App 接口未返回该集播放信息")
 		}
 	}
-	// 两种返回形态都要支持：直接给 video_list，或只给 fallback_api。
-	if hongguoModelHasVideoList(model) {
-		return selectHongguoAppMedia(model)
-	}
-	fallback := hongguoFallbackAddress(model["fallback_api"])
-	if fallback == "" {
-		return providerMedia{}, errors.New("红果 App 接口未返回本集片源地址")
-	}
-	outer, err := downloader.hongguoFallbackJSON(ctx, fallback)
-	if err != nil {
-		return providerMedia{}, err
-	}
-	info := nestedMap(outer, "video_info")
-	inner := nestedMap(info, "data")
-	if len(inner) == 0 {
-		inner = nestedMap(outer, "data")
-	}
-	if len(inner) == 0 {
-		return providerMedia{}, errors.New("红果 App 接口未返回本集片源模型")
-	}
-	var seed []byte
-	if encoded := strings.TrimSpace(mapString(inner, "key_seed")); encoded != "" {
-		decoded, decodeErr := decodeHongguoBase64(encoded)
-		if decodeErr != nil {
-			return providerMedia{}, errors.New("红果 App 媒体地址密钥无效")
-		}
-		seed = decoded
-	}
-	merged := make(map[string]any, len(inner)+len(model))
-	for key, value := range model {
-		merged[key] = value
-	}
-	for key, value := range inner {
-		merged[key] = value
-	}
-	return selectHongguoAppMedia(merged, seed)
+	return downloader.resolveHongguoModelMedia(ctx, model)
 }
 
 func hongguoFallbackAddress(value any) string {
@@ -197,6 +183,9 @@ func (downloader *Downloader) hongguoFallbackJSON(ctx context.Context, rawURL st
 		return nil, err
 	}
 	defer response.Body.Close()
+	if response.Header.Get("Retry-After") != "" {
+		return nil, errors.New("红果片源接口要求稍后重试")
+	}
 	content, err := io.ReadAll(io.LimitReader(response.Body, providerMaxBodyBytes+1))
 	if err != nil {
 		return nil, err
@@ -260,20 +249,33 @@ func selectHongguoAppMedia(model map[string]any, seeds ...[]byte) (providerMedia
 		score int
 	}
 	var choices []scoredMedia
+	failure := &hongguoMediaSelectionError{variants: len(variants)}
 	for _, row := range variants {
-		variant, _ := row.(map[string]any)
+		variant, valid := row.(map[string]any)
+		if !valid || len(variant) == 0 {
+			failure.invalidVariant++
+			continue
+		}
 		meta := nestedMap(variant, "video_meta")
-		codec := strings.ToLower(mapString(meta, "codec_type"))
-		if codec == "bytevc2" || strings.Contains(strings.ToLower(mapString(variant, "gear_des_key")), "bytevc2") {
+		codec := strings.ToLower(strings.TrimSpace(mapString(variant, "codec_type")))
+		if codec == "" {
+			codec = strings.ToLower(strings.TrimSpace(mapString(meta, "codec_type")))
+		}
+		if codec == "bytevc2" || codec == "bvc2" {
+			failure.unsupportedCodec++
 			continue
 		}
 		addresses := hongguoMediaAddresses(variant, seed)
 		if len(addresses) == 0 {
+			failure.unavailableURL++
 			continue
 		}
 		media := providerMedia{Referer: "https://novel.snssdk.com/", Duration: time.Duration(duration * float64(time.Second))}
 		encryption := nestedMap(variant, "encrypt_info")
 		spade := mapString(encryption, "spade_a")
+		if spade == "" {
+			spade = mapString(variant, "spade_a")
+		}
 		if spade != "" || encryption["encrypt"] == true || mapString(encryption, "encryption_method") == "cenc-aes-ctr" {
 			var err error
 			media.CENCKey, err = hongguoContentKey(spade)
@@ -309,7 +311,7 @@ func selectHongguoAppMedia(model map[string]any, seeds ...[]byte) (providerMedia
 	if keyErr != nil {
 		return providerMedia{}, fmt.Errorf("红果 App 媒体密钥不可用: %w", keyErr)
 	}
-	return providerMedia{}, errors.New("红果 App 未返回兼容的媒体，已跳过不支持的编码")
+	return providerMedia{}, failure
 }
 
 // hongguoMediaAddresses 收集候选媒体地址；seed 非空时先按 spade URL 解密。

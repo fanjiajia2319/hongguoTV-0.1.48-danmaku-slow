@@ -100,6 +100,153 @@ class TrackedLookupSession extends SeasonLookupSession {
 }
 
 void main() {
+  for (final broadHit in [true, false]) {
+    test(
+      'follow check uses broad website query first and keeps targeted fallback hit=$broadHit',
+      () async {
+        final repository = LookupRepository();
+        repository.onCatalog = (query, page) async => CatalogPage(
+          query == '合成故事' && !broadHit
+              ? []
+              : [
+                  const Drama(
+                    id: 'hongguo:2',
+                    source: 'hongguo',
+                    title: '合成故事 第二季',
+                    seriesGroupId: '100',
+                    episodes: 20,
+                  ),
+                ],
+        );
+        final result = await NextSeasonResolver(repository).lookup(
+          anchor,
+          knownDramas: [],
+          isCurrent: () => true,
+          requirePlayableDetail: false,
+        );
+        expect(result.next?.id, 'hongguo:2');
+        expect(repository.queries.first, ('合成故事', 1, false));
+        expect(repository.queries.length, broadHit ? 1 : 2);
+        expect(repository.detailIds, isEmpty);
+        expect(repository.metadataIds, isEmpty);
+      },
+    );
+  }
+
+  test(
+    'expired known next is revalidated without repeated title searches',
+    () async {
+      final repository = LookupRepository();
+      const refreshed = Drama(
+        id: 'hongguo:2',
+        source: 'hongguo',
+        title: '合成故事 第二季',
+        seriesGroupId: '100',
+        episodes: 20,
+      );
+      repository.onMetadata = (requested) async {
+        expect(requested.seriesGroupId, isEmpty);
+        expect(requested.title, isEmpty);
+        expect(requested.episodes, 0);
+        return refreshed;
+      };
+      final result = await NextSeasonResolver(repository).lookup(
+        anchor,
+        knownDramas: [next],
+        isCurrent: () => true,
+        trustKnownNext: false,
+        requirePlayableDetail: false,
+        revalidateKnownNext: true,
+      );
+      expect(result.next, same(refreshed));
+      expect(repository.metadataIds, [next.id]);
+      expect(repository.queries, isEmpty);
+      expect(repository.detailIds, isEmpty);
+    },
+  );
+
+  test(
+    'manual refresh still searches for changed next-season relationships',
+    () async {
+      final repository = LookupRepository();
+      final result = await NextSeasonResolver(repository).lookup(
+        anchor,
+        knownDramas: [next],
+        isCurrent: () => true,
+        trustKnownNext: false,
+        requirePlayableDetail: false,
+        revalidateKnownNext: true,
+        force: true,
+      );
+      expect(result.next, isNull);
+      expect(repository.metadataIds, isEmpty);
+      expect(repository.queries, hasLength(3));
+      expect(repository.queries.every((query) => query.$3), isTrue);
+    },
+  );
+
+  for (final fresh in <Drama?>[
+    null,
+    third,
+    const Drama(
+      id: 'hongguo:2',
+      source: 'hongguo',
+      title: '合成故事 第二季',
+      seriesGroupId: '999',
+      episodes: 20,
+    ),
+  ]) {
+    test(
+      'stale known next cannot bypass fresh identity and season validation: ${fresh?.id} ${fresh?.seriesGroupId}',
+      () async {
+        final repository = LookupRepository()..onMetadata = (_) async => fresh;
+        final result = await NextSeasonResolver(repository).lookup(
+          anchor,
+          knownDramas: [next],
+          isCurrent: () => true,
+          trustKnownNext: false,
+          requirePlayableDetail: false,
+          revalidateKnownNext: true,
+        );
+        expect(result.next, isNull);
+        expect(result.complete, isTrue);
+        expect(repository.queries, hasLength(3));
+      },
+    );
+  }
+
+  test('checks first pages before paging a weaker query', () async {
+    final repository = LookupRepository();
+    repository.onCatalog = (query, page) async {
+      if (repository.queries.length == 1) return CatalogPage([], hasMore: true);
+      return CatalogPage([next]);
+    };
+    final result = await NextSeasonResolver(
+      repository,
+    ).lookup(anchor, knownDramas: [], isCurrent: () => true);
+    expect(result.next?.id, next.id);
+    expect(repository.queries.map((call) => call.$2), [1, 1]);
+  });
+
+  test(
+    'follow checks avoid full episode detail after verified metadata',
+    () async {
+      final repository = LookupRepository();
+      final ready = Drama.fromJson({...next.toJson(), 'episodes': 40});
+      repository.onCatalog = (query, page) async => CatalogPage([ready]);
+      final result = await NextSeasonResolver(repository).lookup(
+        anchor,
+        knownDramas: [],
+        isCurrent: () => true,
+        requirePlayableDetail: false,
+      );
+      expect(result.next?.id, next.id);
+      expect(repository.detailIds, isEmpty);
+      expect(result.detail, isNull);
+      expect(repository.queries, hasLength(1));
+    },
+  );
+
   TestWidgetsFlutterBinding.ensureInitialized();
 
   Future<NextSeasonLookupResult> lookup(

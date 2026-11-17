@@ -26,9 +26,26 @@ func searchFixtureTab(request *http.Request, more bool, offset int, passback, da
 	return sourceFixtureResponse(request, 200, fmt.Sprintf(`{"code":0,"search_tabs":[{"tab_type":%s,"has_more":%t,"next_offset":%d,"search_id":"fixture-session","passback":%q,"data":%s}]}`, request.URL.Query().Get("tab_type"), more, offset, passback, data))
 }
 
+func TestHongguoAppSearchAcceptsNestedSearchTabs(t *testing.T) {
+	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != hongguoSearchAppPath {
+			return nil, errors.New("unexpected URL")
+		}
+		return sourceFixtureResponse(r, 200, fmt.Sprintf(`{"code":0,"data":{"search_tabs":[{"tab_type":%s,"has_more":false,"data":[{"video_data":[{"series_id":"12345","title":"合成剧"}]}]}]}}`, r.URL.Query().Get("tab_type"))), nil
+	})
+	searchFixtureIdentity(d)
+	entry, err := d.fetchHongguoAppSearch(context.Background(), "合成剧", 1)
+	if err != nil || len(entry.Dramas) != 1 || entry.Dramas[0].DisplayTitle() != "合成剧" {
+		t.Fatalf("nested tabs: %+v %v", entry, err)
+	}
+}
+
 func TestHongguoSignedSearchPagesReachNextSeason(t *testing.T) {
 	var calls atomic.Int32
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		calls.Add(1)
 		if r.URL.Path != hongguoSearchAppPath {
 			t.Errorf("unexpected fallback: %s", r.URL.Path)
@@ -83,6 +100,9 @@ func TestHongguoSearchFallsBackOnlyWhenAppFailsOrEmpty(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			var web atomic.Int32
 			d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == hongguoSearchAPIPath {
+					return sourceFixtureResponse(r, 503, ""), nil
+				}
 				switch {
 				case r.URL.Path == hongguoSearchAppPath:
 					if mode == "failed" {
@@ -123,6 +143,9 @@ func TestHongguoSearchFallsBackOnlyWhenAppFailsOrEmpty(t *testing.T) {
 func TestHongguoSearchRejectsExpiredAndStalledCursors(t *testing.T) {
 	var calls atomic.Int32
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		calls.Add(1)
 		return searchFixtureTab(r, true, 0, "same", `[{"video_data":[{"series_id":"12345","title":"合成剧"}]}]`), nil
 	})
@@ -156,6 +179,9 @@ func TestHongguoSearchParsesLynxCellsAndDeduplicates(t *testing.T) {
 func TestHongguoSearchRegistrationMatchesReferenceAndPersistsIdentity(t *testing.T) {
 	var registrations atomic.Int32
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		registrations.Add(1)
 		if r.URL.Path != "/service/2/device_register/" || r.Header.Get("X-Gorgon") != "" {
 			t.Error("registration route or headers wrong")
@@ -203,6 +229,9 @@ func TestHongguoSearchRegistrationMatchesReferenceAndPersistsIdentity(t *testing
 		t.Fatalf("identity file permissions: %v", info.Mode())
 	}
 	restored := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		t.Error("persisted identity was not reused")
 		return nil, errors.New("unexpected registration")
 	}, false)
@@ -216,6 +245,9 @@ func TestHongguoSearchRegistrationMatchesReferenceAndPersistsIdentity(t *testing
 func TestHongguoSearchCancellationDoesNotFallback(t *testing.T) {
 	var requests atomic.Int32
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		requests.Add(1)
 		return nil, errors.New("unexpected request")
 	})
@@ -241,6 +273,9 @@ func TestHongguoSearchRegistrationWaitRespectsCancellation(t *testing.T) {
 func TestNativeHongguoSearchExposesServerPagination(t *testing.T) {
 	var requests atomic.Int32
 	engine := sourceFixtureEngine(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		requests.Add(1)
 		return searchFixtureTab(r, true, 20, "cursor-20", `[{"video_data":[{"series_id":"12345","title":"合成剧"}]}]`), nil
 	})
@@ -265,6 +300,9 @@ func TestHongguoSearchRetriesBusyCodeWithoutChangingDevice(t *testing.T) {
 	calls := map[string]int{}
 	var mu sync.Mutex
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		key := r.URL.Query().Get("tab_type")
@@ -286,6 +324,9 @@ func TestHongguoSearchRetriesBusyCodeWithoutChangingDevice(t *testing.T) {
 
 func TestHongguoPartialSecondPageRetainsSuccessfulTab(t *testing.T) {
 	d := sourceFixtureDownloader(t, func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == hongguoSearchAPIPath {
+			return sourceFixtureResponse(r, 503, ""), nil
+		}
 		if r.URL.Path != hongguoSearchAppPath {
 			t.Fatalf("unexpected webpage fallback: %s", r.URL.Path)
 		}

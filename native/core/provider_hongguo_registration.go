@@ -48,6 +48,7 @@ type hongguoDeviceIdentity struct {
 	DeviceID  string `json:"deviceId"`
 	InstallID string `json:"installId"`
 	Cookie    string `json:"cookie"`
+	CDID      string `json:"cdid,omitempty"`
 }
 
 func (identity hongguoDeviceIdentity) valid() bool {
@@ -80,20 +81,30 @@ func (d *Downloader) ensureHongguoDeviceIdentity(ctx context.Context, rejected .
 		}
 		client.deviceIdentityLoaded = true
 	}
+	background, _ := ctx.Value(backgroundCatalogKey{}).(bool)
+	mobile, _ := ctx.Value(hongguoMobileModelKey{}).(bool)
+	if mobile && background && !client.deviceIdentity.valid() {
+		return hongguoDeviceIdentity{}, errors.New("红果后台预取等待前台设备注册")
+	}
 	rotate := len(rejected) > 0 && rejected[0] == client.deviceIdentity.DeviceID
 	if !client.deviceIdentity.valid() || rotate {
-		if rotate && time.Now().Before(client.deviceRotationPausedUntil) {
+		if time.Now().Before(client.deviceRotationPausedUntil) {
 			return hongguoDeviceIdentity{}, errors.New("红果设备注册暂不可用，请稍后重试")
 		}
 		deviceID, installID, cookie, err := d.registerHongguoDevice(ctx)
 		if err != nil {
-			if rotate && ctx.Err() == nil {
+			var rejection hongguoRegisterRejection
+			if errors.As(err, &rejection) && ctx.Err() == nil {
 				client.deviceRotationPausedUntil = time.Now().Add(10 * time.Minute)
 			}
 			return hongguoDeviceIdentity{}, err
 		}
 		client.deviceIdentityPersisted = false
 		client.deviceIdentity = hongguoDeviceIdentity{DeviceID: deviceID, InstallID: installID, Cookie: cookie}
+	}
+	if client.deviceIdentity.CDID == "" {
+		client.deviceIdentity.CDID = uuidLike()
+		client.deviceIdentityPersisted = false
 	}
 	if d.cfg.dataDir != "" && !client.deviceIdentityPersisted {
 		body, _ := json.Marshal(client.deviceIdentity)

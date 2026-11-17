@@ -1,0 +1,72 @@
+name: Publish validated macOS package
+on:
+  push:
+    branches: [release/macos-0.1.53-97]
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: hongguotv-stable-publication
+  cancel-in-progress: false
+env:
+  MACOS_BUILD_RUN: '0'
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the exact new macOS build pins before reading artifacts
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          import publish_macos
+          publish_macos.require_pins()
+          publish_macos.validate_release_source(publish_macos.BUILD_COMMIT)
+          if str(publish_macos.BUILD_RUN) != os.environ['MACOS_BUILD_RUN']:
+              raise SystemExit('macOS artifact run does not match the pinned new build')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-universal
+          path: artifacts/package
+          run-id: ${{ env.MACOS_BUILD_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-smoke-macos-15
+          path: artifacts/arm64
+          run-id: ${{ env.MACOS_BUILD_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-smoke-macos-15-intel
+          path: artifacts/x86_64
+          run-id: ${{ env.MACOS_BUILD_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-autoplay-macos-15
+          path: artifacts/playback-arm64
+          run-id: ${{ env.MACOS_BUILD_RUN }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-autoplay-macos-15-intel
+          path: artifacts/playback-x86_64
+          run-id: ${{ env.MACOS_BUILD_RUN }}
+          github-token: ${{ github.token }}
+      - name: Publish and verify public download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish_macos.py publish
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-public-verification
+          path: dist/macos-publish/**
+          if-no-files-found: warn

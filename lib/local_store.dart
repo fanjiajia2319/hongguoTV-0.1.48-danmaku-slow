@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -42,6 +43,21 @@ class LocalStore extends ChangeNotifier {
   final Map<String, FollowState> _followStates = {};
   final Map<String, Drama> _seriesCandidates = {};
   final Map<String, SeasonCheck> _seasonChecks = {};
+  final Map<String, Completer<void>> _seasonCheckInFlight = {};
+
+  Future<void>? seasonCheckPending(String id, int epoch) =>
+      _seasonCheckInFlight['$epoch:$id']?.future;
+  bool beginSeasonCheck(String id, int epoch) {
+    final key = '$epoch:$id';
+    if (_seasonCheckInFlight.containsKey(key)) return false;
+    _seasonCheckInFlight[key] = Completer<void>();
+    return true;
+  }
+
+  void endSeasonCheck(String id, int epoch) {
+    _seasonCheckInFlight.remove('$epoch:$id')?.complete();
+  }
+
   final _seriesIndex = <String, List<Drama>>{};
   final _seriesGroupIndex = <String, List<Drama>>{};
   final _seriesCharacterIndex = <String, List<Drama>>{};
@@ -686,6 +702,11 @@ class LocalStore extends ChangeNotifier {
     );
   }
 
+  Future<void> setPortraitVideoOffset(double value) =>
+      _updatePlaybackPreferences(
+        (current) => current.copyWith(portraitVideoOffset: value),
+      );
+
   Future<void> setWindowsVideoCompatibility(bool value) =>
       _updatePlaybackPreferences(
         (current) => current.copyWith(windowsVideoCompatibility: value),
@@ -764,6 +785,18 @@ class LocalStore extends ChangeNotifier {
     }
     _seriesWatchCache[key] = latest;
     return latest;
+  }
+
+  bool hasConfirmedNoNextSeason(Drama drama) {
+    if (!allowsSource(drama.source)) return false;
+    final current = seriesWatch(drama)?.drama ?? drama;
+    final check = _seasonChecks[current.id];
+    return check != null &&
+        check.matches(current) &&
+        check.complete &&
+        check.nextId == null &&
+        check.retryAt == null &&
+        check.isFresh(_now());
   }
 
   bool hasNextSeason(Drama drama) {
@@ -1022,10 +1055,11 @@ class LocalStore extends ChangeNotifier {
     });
   }
 
-  Future<void> saveWatch(WatchEntry entry) {
+  Future<void> saveWatch(WatchEntry entry, {bool quiet = false}) {
     final epoch = _epoch;
     return _queue(() async {
       if (!allowsSource(entry.drama.source) || epoch != _epoch) return;
+      final latest = _history.values.firstOrNull;
       final previous = _history[entry.drama.id]?.drama;
       final current = previous == null
           ? entry
@@ -1048,6 +1082,18 @@ class LocalStore extends ChangeNotifier {
           current.drama,
         );
       }
+      final changed =
+          !quiet ||
+          latest == null ||
+          latest.drama.id != current.drama.id ||
+          latest.episode != current.episode ||
+          jsonEncode(latest.drama.toJson()) !=
+              jsonEncode(current.drama.toJson()) ||
+          (following != null &&
+              (jsonEncode(following.toJson()) !=
+                      jsonEncode(states[entry.drama.id]!.toJson()) ||
+                  jsonEncode(_favorites[entry.drama.id]!.toJson()) !=
+                      jsonEncode(favorites[entry.drama.id]!.toJson())));
       await _commit({
         _key('history'): jsonEncode(
           sorted.take(300).map((entry) => entry.toJson()).toList(),
@@ -1060,7 +1106,7 @@ class LocalStore extends ChangeNotifier {
         },
       }, syncUrgent: false);
       _loadLibrary();
-      _notify();
+      if (changed) _notify();
     });
   }
 
@@ -1231,7 +1277,7 @@ class LocalStore extends ChangeNotifier {
             _checkedNext(mergedAnchor, previous)) {
           check = previous;
         }
-        final earliest = now.add(const Duration(seconds: 30));
+        final earliest = now.add(const Duration(seconds: 5));
         check = check.retrying(
           retryAt: retryAt != null && retryAt.isAfter(earliest)
               ? retryAt

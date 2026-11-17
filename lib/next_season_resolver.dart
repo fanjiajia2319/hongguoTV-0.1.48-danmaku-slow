@@ -42,6 +42,9 @@ class NextSeasonResolver {
     required bool Function() isCurrent,
     bool trustKnownNext = true,
     bool force = false,
+    bool requirePlayableDetail = true,
+    bool revalidateKnownNext = false,
+    bool singleSearch = false,
   }) async {
     if (anchor.source != SourceSite.hongguo.id ||
         normalizedSearchText(anchor.title).isEmpty) {
@@ -254,6 +257,9 @@ class NextSeasonResolver {
         matches = [narrowed];
       }
       var candidate = matches.single;
+      if (!requirePlayableDetail && candidate.episodes > 0) {
+        return result(next: candidate);
+      }
       candidate = await withDetail(candidate);
       candidates[candidate.id] = candidate;
       final detail = details[candidate.id];
@@ -277,6 +283,42 @@ class NextSeasonResolver {
 
     try {
       checkCurrent();
+      if (revalidateKnownNext &&
+          !force &&
+          !requirePlayableDetail &&
+          anchor.seriesGroupId.isNotEmpty) {
+        final prior = knownDramas
+            .where(
+              (drama) =>
+                  consecutive(drama) &&
+                  drama.seriesGroupId == anchor.seriesGroupId,
+            )
+            .toList();
+        if (prior.length == 1) {
+          try {
+            final fresh = await bounded(
+              () => session.metadata(
+                Drama(
+                  id: prior.single.id,
+                  source: prior.single.source,
+                  title: '',
+                ),
+              ),
+            );
+            if (fresh != null &&
+                fresh.id == prior.single.id &&
+                fresh.source == anchor.source &&
+                consecutive(fresh) &&
+                fresh.seriesGroupId == anchor.seriesGroupId &&
+                fresh.episodes > 0) {
+              candidates[fresh.id] = fresh;
+              return result(next: fresh);
+            }
+          } catch (error) {
+            failed(error);
+          }
+        }
+      }
       final known = await verifiedNext();
       if (known != null) return known;
       final generated = hongguoNextSeasonQueries(anchor);
@@ -293,12 +335,13 @@ class NextSeasonResolver {
       }.take(2);
       final broad = current?.baseTitle ?? anchor.title.trim();
       final queries = <String>{
+        if (!requirePlayableDetail) broad,
         ...targeted,
         broad,
       }.where((query) => normalizedSearchText(query).isNotEmpty);
-      for (final query in queries) {
-        var exhausted = false;
-        for (var page = 1; page <= 3; page++) {
+      final pending = (singleSearch ? queries.take(1) : queries).toSet();
+      for (var page = 1; page <= 3 && pending.isNotEmpty; page++) {
+        for (final query in pending.toList()) {
           checkCurrent();
           CatalogPage response;
           try {
@@ -312,7 +355,9 @@ class NextSeasonResolver {
             );
           } catch (error) {
             failed(error);
-            break;
+            pending.remove(query);
+            if (singleSearch) return result();
+            continue;
           }
           for (final fresh in response.items) {
             if (fresh.source != anchor.source) continue;
@@ -329,14 +374,14 @@ class NextSeasonResolver {
           }
           final found = await verifiedNext();
           if (found != null) return found;
+          if (singleSearch) return result(complete: !incomplete);
           if (!response.hasMore) {
-            exhausted = true;
-            break;
+            pending.remove(query);
           }
-          if (response.warning.isNotEmpty) break;
+          if (response.warning.isNotEmpty) pending.remove(query);
         }
-        if (!exhausted) incomplete = true;
       }
+      if (pending.isNotEmpty) incomplete = true;
       checkCurrent();
       return result(complete: !incomplete);
     } finally {

@@ -314,13 +314,13 @@ class _HeldWatchStore extends LocalStore {
   final releaseWrite = Completer<void>();
 
   @override
-  Future<void> saveWatch(WatchEntry entry) async {
+  Future<void> saveWatch(WatchEntry entry, {bool quiet = false}) async {
     if (holdTailWrite && entry.episode == 1 && entry.position == 119) {
       holdTailWrite = false;
       writeStarted.complete();
       await releaseWrite.future;
     }
-    await super.saveWatch(entry);
+    await super.saveWatch(entry, quiet: quiet);
   }
 }
 
@@ -610,7 +610,7 @@ void main() {
       expect(harness.store.history.single.episode, 2);
       expect(harness.store.history.single.position, 3);
       expect(harness.store.history.single.duration, 90);
-      await _press(tester, LogicalKeyboardKey.arrowUp);
+      await _press(tester, LogicalKeyboardKey.arrowDown);
       expect(find.byKey(const ValueKey('tv-control-panel')), findsOneWidget);
       await _dispose(tester, harness);
     },

@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+
+import 'app_layout.dart';
 
 import 'models.dart';
 import 'download_preferences.dart';
@@ -44,12 +47,13 @@ class _DownloadPickerState extends State<DownloadPicker> {
     });
     if (choices.length > 500) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已选前 500 集；可清空后按分组选择其他集数，或从发现页使用整剧批量下载')),
+        const SnackBar(content: Text('已选前 500 集；可清空后选择其他集数，或从发现页使用整剧批量下载')),
       );
     }
   }
 
   void _toggle(Episode episode) {
+    if (_submitting) return;
     if (!_selected.contains(episode.number) && _selected.length >= 500) {
       ScaffoldMessenger.of(
         context,
@@ -91,6 +95,11 @@ class _DownloadPickerState extends State<DownloadPicker> {
   @override
   Widget build(BuildContext context) {
     final episodes = widget.detail.episodes;
+    final phone =
+        !AppLayout.isTelevision(context) &&
+        !AppLayout.isTelevisionDevice(context) &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS);
     final hasVip = episodes.any(
       (episode) => episode.vip && _selected.contains(episode.number),
     );
@@ -217,7 +226,21 @@ class _DownloadPickerState extends State<DownloadPicker> {
                   selectedNumbers: _selected,
                   keyPrefix: 'download-episode',
                   compact: widget.embedded,
+                  unpaged: phone,
+                  preserveScrollOnResize: true,
                   onSelected: (index) => _toggle(episodes[index]),
+                  onSelectionChanged: _submitting
+                      ? null
+                      : (selected) {
+                          setState(() {
+                            _selected.clear();
+                            _selected.addAll(selected);
+                          });
+                        },
+                  onSelectionLimit: () =>
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('一次最多加入 500 集，请分批下载')),
+                      ),
                 ),
               ),
               Padding(

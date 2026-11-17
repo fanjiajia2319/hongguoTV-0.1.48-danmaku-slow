@@ -43,6 +43,8 @@ func (d *Downloader) providerBaseURL(source string) string {
 		configured, fallback = d.cfg.SoraniURL, soraniSiteBaseURL
 	case sourceGuipian:
 		configured, fallback = d.cfg.GuipianURL, guipianSiteBaseURL
+	case sourceBeabox:
+		configured, fallback = d.cfg.BeaboxURL, beaboxBaseURL
 	case sourceHanxiaoquan:
 		configured, fallback = d.cfg.HanxiaoquanURL, hanxiaoquanSiteBaseURL
 	default:
@@ -117,6 +119,9 @@ func (d *Downloader) providerURLCandidates(raw string) []string {
 
 func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (providerMedia, error) {
 	chapter := task.Chapter
+	if strings.HasPrefix(chapter.VideoURL, "hghub://") {
+		return d.resolveHGHub(ctx, task)
+	}
 	chapter.Source = canonicalProviderSource(chapter.Source)
 	if chapter.Source == "" {
 		chapter.Source = sourceFromDramaID(task.DramaID)
@@ -138,6 +143,9 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 	}
 	if chapter.Source == sourceGuipian {
 		return d.resolveGuipianMedia(ctx, task)
+	}
+	if chapter.Source == sourceBeabox {
+		return d.resolveBeaboxMedia(ctx, task)
 	}
 	if chapter.Source == sourceHanxiaoquan {
 		return d.resolveHanxiaoquanMedia(ctx, task)

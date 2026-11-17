@@ -26,6 +26,7 @@ class SavedLibrary extends StatefulWidget {
     required this.onContinue,
     this.onDownload,
     this.refreshToken = 0,
+    this.followUpdates,
   });
 
   final AppRepository repository;
@@ -35,6 +36,7 @@ class SavedLibrary extends StatefulWidget {
   final ValueChanged<Drama> onContinue;
   final ValueChanged<Drama>? onDownload;
   final int refreshToken;
+  final FollowUpdates? followUpdates;
 
   @override
   State<SavedLibrary> createState() => _SavedLibraryState();
@@ -48,7 +50,8 @@ class _SavedLibraryState extends State<SavedLibrary> {
   @override
   void initState() {
     super.initState();
-    _updates = FollowUpdates(widget.repository, widget.store);
+    _updates =
+        widget.followUpdates ?? FollowUpdates(widget.repository, widget.store);
     _updatesEpoch = widget.store.profileEpoch;
     if (!widget.history) unawaited(_refreshUpdates());
   }
@@ -59,10 +62,13 @@ class _SavedLibraryState extends State<SavedLibrary> {
     final reset =
         oldWidget.repository != widget.repository ||
         oldWidget.store != widget.store ||
+        oldWidget.followUpdates != widget.followUpdates ||
         _updatesEpoch != widget.store.profileEpoch;
     if (reset) {
-      _updates.dispose();
-      _updates = FollowUpdates(widget.repository, widget.store);
+      if (oldWidget.followUpdates == null) _updates.dispose();
+      _updates =
+          widget.followUpdates ??
+          FollowUpdates(widget.repository, widget.store);
       _updatesEpoch = widget.store.profileEpoch;
       _search.clear();
     }
@@ -107,7 +113,7 @@ class _SavedLibraryState extends State<SavedLibrary> {
 
   @override
   void dispose() {
-    _updates.dispose();
+    if (widget.followUpdates == null) _updates.dispose();
     _search.dispose();
     super.dispose();
   }
@@ -170,10 +176,19 @@ class _SavedLibraryState extends State<SavedLibrary> {
     final hasNextSeason = followed && widget.store.hasNextSeason(drama);
     final badge = hasNextSeason
         ? '已有下季'
+        : !widget.history &&
+              followed &&
+              widget.store.hasConfirmedNoNextSeason(drama)
+        ? '没找到下季'
         : followed && widget.history
         ? '已追剧'
         : null;
-    final season = watched == null ? null : hongguoSeriesInfo(watched.drama);
+    final season = hongguoSeriesInfo(target);
+    final subtitle = widget.history
+        ? watched == null
+              ? SourceSite.byId(drama.source).name
+              : '${season == null ? '' : '第 ${season.season} ${season.unit} · '}第 ${watched.episode} 集 · ${formatPosition(watched.position)}'
+        : '${season == null ? '' : '${season.season} ${season.unit} · '}${watched?.episode ?? 0}/${target.episodes > 0 ? target.episodes : '?'}';
     if (compact) {
       return TelevisionSavedTile(
         key: ValueKey('saved-${drama.id}'),
@@ -189,9 +204,8 @@ class _SavedLibraryState extends State<SavedLibrary> {
         ),
         badge: badge,
         hasNextSeason: hasNextSeason,
-        subtitle: watched == null
-            ? SourceSite.byId(drama.source).name
-            : '${season == null ? '' : '第 ${season.season} ${season.unit} · '}第 ${watched.episode} 集 · ${formatPosition(watched.position)}',
+        showEpisodeCount: widget.history,
+        subtitle: subtitle,
       );
     }
     return DramaTile(
@@ -207,9 +221,8 @@ class _SavedLibraryState extends State<SavedLibrary> {
         onPressed: () => _actions(drama),
       ),
       badge: badge,
-      subtitle: watched == null
-          ? SourceSite.byId(drama.source).name
-          : '${season == null ? '' : '第 ${season.season} ${season.unit} · '}第 ${watched.episode} 集 · ${formatPosition(watched.position)}',
+      showEpisodeCount: widget.history,
+      subtitle: subtitle,
     );
   }
 

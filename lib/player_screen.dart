@@ -38,6 +38,7 @@ import 'playback_preloader.dart';
 import 'playback_recovery.dart';
 import 'playback_preferences.dart';
 import 'player_controls.dart';
+import 'portrait_video_frame.dart';
 import 'player_interactions.dart';
 import 'episode_swipe_surface.dart';
 import 'player_menu.dart';
@@ -141,6 +142,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _handoffOwned = true;
   double? _lanFirstPosition;
   String? _savedProgressKey;
+  bool _savedQuietly = false;
   final _health = PlaybackHealth();
   Timer? _saveTimer;
   Timer? _windowsVolumeTimer;
@@ -234,6 +236,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   VideoEnhancementController? get _enhancementForUi =>
       _enhancement.supported ? _enhancement : null;
   PlaybackPreferences get _preferences => PlaybackPreferences(
+    portraitVideoOffset: widget.store.playbackPreferences.portraitVideoOffset,
     speed: _speed,
     quality: _requestedQuality,
     autoAdvance: _autoAdvance,
@@ -583,7 +586,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
     _saveTimer = Timer.periodic(
       const Duration(seconds: 5),
-      (_) => _saveProgress(),
+      (_) => _saveProgress(quiet: true),
     );
     _healthTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _syncScreenOn();
@@ -2343,6 +2346,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   Future<void> _saveProgress({
     bool flush = false,
+    bool quiet = false,
     DramaDetail? snapshotDetail,
     int? snapshotIndex,
     Duration? snapshotPosition,
@@ -2380,7 +2384,9 @@ class _PlayerScreenState extends State<PlayerScreen>
     final store = widget.store;
     final progressKey =
         '${widget.mediaId ?? openedDetail.drama.id}:$openedIndex:$position:$duration';
-    if (_savedProgressKey == progressKey && _saveWarning == null) {
+    if (_savedProgressKey == progressKey &&
+        _saveWarning == null &&
+        (quiet || !_savedQuietly)) {
       if (flush && widget.mediaId == null) LanController.current?.flush();
       return;
     }
@@ -2395,7 +2401,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       final pending = _progressWrites.catchError((Object _) {}).then((_) async {
         if (store.profileEpoch != _profileEpoch) return;
         if (widget.mediaId == null) {
-          await store.saveWatch(entry);
+          await store.saveWatch(entry, quiet: quiet);
           if (flush) LanController.current?.flush();
         } else {
           await store.saveMediaWatch(widget.mediaId!, entry);
@@ -2404,6 +2410,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _progressWrites = pending;
       await pending;
       _savedProgressKey = progressKey;
+      _savedQuietly = quiet;
       if (mounted && !_closed && _saveWarning != null) {
         setState(() => _saveWarning = null);
       }
@@ -3257,24 +3264,29 @@ class _PlayerScreenState extends State<PlayerScreen>
       quality: selection.quality,
     );
     if (!mounted || _closed) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(added == 0 ? '所选集数已在下载列表中' : '已加入 $added 集，已有任务自动跳过'),
-        action: SnackBarAction(
-          label: '查看',
-          onPressed: () {
-            Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => DownloadsScreen(
-                  repository: widget.repository,
-                  store: widget.store,
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          persist: false,
+          duration: const Duration(seconds: 4),
+          showCloseIcon: true,
+          content: Text(added == 0 ? '所选集数已在下载列表中' : '已加入 $added 集，已有任务自动跳过'),
+          action: SnackBarAction(
+            label: '查看',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => DownloadsScreen(
+                    repository: widget.repository,
+                    store: widget.store,
+                  ),
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
-      ),
-    );
+      );
   }
 
   bool get _canBrowseSeasons =>
@@ -3994,6 +4006,11 @@ class _PlayerScreenState extends State<PlayerScreen>
     final title =
         '${_detail.drama.title} · ${episodeProgressLabel(_detail, _index)}${_plan?.local == true ? ' · 本地' : ''}${_detail.episodes[_index].vip ? ' · VIP 试看' : ''}${(_plan?.routeIndex ?? 0) > 0 ? ' · 线路 ${_plan!.routeIndex + 1}' : ''}';
     final hideOverlayForPictureInPicture = _pictureInPictureVisible;
+    final topAlignedLandscapeVideo =
+        defaultTargetPlatform == TargetPlatform.android &&
+        !_televisionDevice &&
+        _portraitWatching &&
+        !hideOverlayForPictureInPicture;
     final Widget controls = hideOverlayForPictureInPicture
         ? const SizedBox.shrink()
         : _television
@@ -4048,6 +4065,8 @@ class _PlayerScreenState extends State<PlayerScreen>
             title: _detail.drama.title,
             episodeLabel: episodeProgressLabel(_detail, _index),
             portraitFooter: _portraitWatching ? _mobilePortraitFooter() : null,
+            topAlignedLandscapeVideo: topAlignedLandscapeVideo,
+            videoAspectRatio: _aspectRatio,
             onTogglePlayback: _togglePlayback,
             onForward: () => _seek(15, resumeAfterSeek: true),
             swipeEnabled: _mobile,
@@ -4126,7 +4145,11 @@ class _PlayerScreenState extends State<PlayerScreen>
                       ColoredBox(
                         key: const ValueKey('automatic-transition-frame'),
                         color: Colors.black,
-                        child: RawImage(image: image, fit: BoxFit.contain),
+                        child: PortraitVideoFrame(
+                          enabled: topAlignedLandscapeVideo,
+                          aspectRatio: image.width / image.height,
+                          child: RawImage(image: image, fit: BoxFit.contain),
+                        ),
                       ),
                     if (failure != null && !hideOverlayForPictureInPicture)
                       Align(
@@ -4145,6 +4168,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           DanmakuOverlay(
             controller: _danmaku,
             currentVisible: !_hasRetainedFrame,
+            topAlignedLandscapeVideo: topAlignedLandscapeVideo,
             animationBehavior: AppLayout.isTelevisionDevice(context)
                 ? AnimationBehavior.preserve
                 : AnimationBehavior.normal,
@@ -4216,6 +4240,7 @@ class _PlayerScreenState extends State<PlayerScreen>
               else if (_player is LunaExoPlayer)
                 LunaExoVideoView(
                   player: _player,
+                  topAlignedLandscapeVideo: topAlignedLandscapeVideo,
                   fit: BoxFit.contain,
                   controls: (_) => layeredControls,
                 )
@@ -4410,19 +4435,27 @@ class _PlayerScreenState extends State<PlayerScreen>
         },
       ),
     );
-    return EpisodeSwipeSurface(
-      interactions: _interactions,
-      enabled: _mobile && !_showFullscreen,
-      contentReady: !_loading && _error == null,
-      currentLabel:
-          '${_detail.drama.title}\n${episodeProgressLabel(_detail, _index)}',
-      previousLabel: _index > 0
-          ? '${_detail.drama.title}\n第 ${_detail.episodes[_index - 1].number} 集'
-          : '已经是第一集',
-      nextLabel: _index + 1 < _detail.episodes.length
-          ? '${_detail.drama.title}\n第 ${_detail.episodes[_index + 1].number} 集'
-          : '已经是最后一集',
-      child: pane,
+    return ListenableBuilder(
+      listenable: widget.store,
+      builder: (context, child) => PortraitVideoPosition(
+        offset: widget.store.playbackPreferences.portraitVideoOffset,
+        child: child!,
+      ),
+      child: EpisodeSwipeSurface(
+        interactions: _interactions,
+        topAlignedLandscapeVideo: topAlignedLandscapeVideo,
+        enabled: _mobile && !_showFullscreen,
+        contentReady: !_loading && _error == null,
+        currentLabel:
+            '${_detail.drama.title}\n${episodeProgressLabel(_detail, _index)}',
+        previousLabel: _index > 0
+            ? '${_detail.drama.title}\n第 ${_detail.episodes[_index - 1].number} 集'
+            : '已经是第一集',
+        nextLabel: _index + 1 < _detail.episodes.length
+            ? '${_detail.drama.title}\n第 ${_detail.episodes[_index + 1].number} 集'
+            : '已经是最后一集',
+        child: pane,
+      ),
     );
   }
 

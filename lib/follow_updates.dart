@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import 'core_bridge.dart';
@@ -12,6 +14,7 @@ class FollowUpdates extends ChangeNotifier {
   final LocalStore store;
   final int _epoch;
   bool checking = false;
+  bool _forcePending = false;
   int checked = 0;
   int total = 0;
   int failed = 0;
@@ -24,13 +27,21 @@ class FollowUpdates extends ChangeNotifier {
   Drama _anchor(Drama drama) =>
       store.seriesWatch(drama)?.drama ?? store.followedSeries(drama) ?? drama;
 
+  bool _shouldCheck(Drama drama, {bool force = false}) =>
+      !store.hasNextSeason(drama) &&
+      store.shouldCheckNextSeason(_anchor(drama), force: force);
+
   Future<void> refresh({bool force = false}) async {
-    if (!_valid || checking) return;
-    final dramas = store.trackedSeries
+    if (!_valid) return;
+    if (checking) {
+      if (force) _forcePending = true;
+      return;
+    }
+    final tracked = store.trackedSeries
         .where((drama) => drama.source == SourceSite.hongguo.id)
-        .where(
-          (drama) => store.shouldCheckNextSeason(_anchor(drama), force: force),
-        )
+        .toList();
+    final dramas = tracked
+        .where((drama) => _shouldCheck(drama, force: force))
         .toList();
     final generation = ++_generation;
     bool current() => _valid && generation == _generation;
@@ -46,10 +57,32 @@ class FollowUpdates extends ChangeNotifier {
           cursor < dramas.length) {
         final drama = dramas[cursor++];
         if (store.followedSeries(drama) == null ||
-            !store.shouldCheckNextSeason(_anchor(drama), force: force)) {
+            !_shouldCheck(drama, force: force)) {
           continue;
         }
-        final anchor = _anchor(drama);
+        var anchor = _anchor(drama);
+        var claimed = false;
+        while (current()) {
+          final pending = store.seasonCheckPending(anchor.id, _epoch);
+          if (pending != null) {
+            await pending;
+            if (!current() || store.followedSeries(drama) == null) break;
+            anchor = _anchor(drama);
+            if (!_shouldCheck(drama, force: force)) break;
+            continue;
+          }
+          if (store.beginSeasonCheck(anchor.id, _epoch)) {
+            claimed = true;
+            break;
+          }
+        }
+        if (!claimed) continue;
+        if (!current() ||
+            store.followedSeries(drama) == null ||
+            !_shouldCheck(drama, force: force)) {
+          store.endSeasonCheck(anchor.id, _epoch);
+          continue;
+        }
         final expected = SeasonCheck.observed(
           anchor,
           checkedAt: store.seasonCheckTime,
@@ -67,6 +100,8 @@ class FollowUpdates extends ChangeNotifier {
             knownDramas: store.seriesDramasFor(drama),
             isCurrent: stillCurrent,
             trustKnownNext: false,
+            requirePlayableDetail: false,
+            singleSearch: true,
             force: force,
           );
           if (!current()) return;
@@ -101,25 +136,32 @@ class FollowUpdates extends ChangeNotifier {
               );
             } catch (_) {}
           }
+        } finally {
+          store.endSeasonCheck(anchor.id, _epoch);
         }
         if (!current()) return;
         checked++;
         notifyListeners();
-        await Future<void>.delayed(const Duration(milliseconds: 16));
       }
     }
 
     try {
-      await Future.wait([worker(), worker()]);
+      await Future.wait(
+        List.generate(tracked.length > 3 ? 3 : 1, (_) => worker()),
+      );
     } finally {
       if (current()) {
         checking = false;
+        final repeat = _forcePending;
+        _forcePending = false;
         notifyListeners();
+        if (repeat) unawaited(refresh(force: true));
       }
     }
   }
 
   void cancel() {
+    _forcePending = false;
     _generation++;
     checking = false;
   }
