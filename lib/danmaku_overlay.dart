@@ -872,10 +872,7 @@ class _DanmakuMotionState extends State<_DanmakuMotion> {
     );
     _anchorProgress = progress ?? elapsed / widget.lifetimeMs;
     _anchorTime = widget.clock.value;
-    final reduced =
-        widget.animationBehavior == AnimationBehavior.normal &&
-        SemanticsBinding.instance.disableAnimations;
-    _rate = widget.moving ? widget.rate * (reduced ? 20 : 1) : 0;
+    _rate = widget.moving ? widget.rate : 0;
   }
 
   @override
