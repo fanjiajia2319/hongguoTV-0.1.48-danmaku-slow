@@ -308,7 +308,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       _motionKeys.clear();
     }
     if (_planRevision != controller.planRevision) {
-      _retireVisible();
+      _clearRetiring();
       _planRevision = controller.planRevision;
       _endedPlanRevision = null;
       _realtimeLayout = null;
