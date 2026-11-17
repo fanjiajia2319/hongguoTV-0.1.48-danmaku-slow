@@ -1,6 +1,6 @@
 import 'danmaku_text.dart';
 
-const danmakuBaselineSpeed = 0.05;
+const danmakuBaselineSpeed = 0.15;
 
 const danmakuWindowMs = 30000;
 const danmakuLifetimeMs = 8000;
